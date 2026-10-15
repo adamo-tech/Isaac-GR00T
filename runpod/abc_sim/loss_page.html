@@ -1,0 +1,168 @@
+<title>abc-sim Finetune Losses</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one column, a summary row of final losses above one full-width log-scale chart, table below. */
+:root {
+  --bg: #fbfbf9; --surface: #ffffff; --fg: #1f2421; --fg-2: #535a55; --muted: #8a908b;
+  --grid: #e7e8e3; --axis: #c9ccc5; --line: #dfe1db;
+  --s-gr00t: #1baf7a; --s-pi05: #2a78d6; --s-dm05: #eb6834;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-data: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #161816; --surface: #1d201d; --fg: #eceee9; --fg-2: #b9beb7; --muted: #868c85;
+  --grid: #2a2e2a; --axis: #434842; --line: #333833;
+  --s-gr00t: #199e70; --s-pi05: #3987e5; --s-dm05: #d95926; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #161816; --surface: #1d201d; --fg: #eceee9; --fg-2: #b9beb7; --muted: #868c85;
+  --grid: #2a2e2a; --axis: #434842; --line: #333833;
+  --s-gr00t: #199e70; --s-pi05: #3987e5; --s-dm05: #d95926; color-scheme: dark }
+body { background: var(--bg); color: var(--fg); font-family: var(--font-body); font-size: 15px; line-height: 1.5;
+  padding-block: 32px 48px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+main { max-width: 1000px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
+h1 { font-size: 1.6rem; font-weight: 600; margin: 0; text-wrap: balance; letter-spacing: -0.01em; }
+.sub { color: var(--fg-2); margin: 4px 0 0; max-width: 68ch; }
+.eyebrow { font-family: var(--font-data); font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.tile { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.tile .name { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+.sw { width: 12px; height: 3px; border-radius: 2px; flex: none; }
+.tile .val { font-family: var(--font-data); font-size: 1.5rem; font-variant-numeric: tabular-nums; }
+.tile .meta { color: var(--fg-2); font-size: 0.85rem; }
+.chart { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 16px; position: relative; min-width: 0; }
+.legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 0.9rem; color: var(--fg-2); margin-bottom: 8px; }
+.legend span { display: flex; align-items: center; gap: 6px; }
+svg { display: block; width: 100%; height: auto; }
+svg text { font-family: var(--font-data); font-size: 11px; fill: var(--muted); }
+svg .lbl { font-family: var(--font-body); font-size: 12px; font-weight: 500; fill: var(--fg); }
+.tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--axis); border-radius: 6px; padding: 8px 10px; font-size: 0.85rem; box-shadow: 0 4px 14px rgb(0 0 0 / 0.12); min-width: 170px; }
+.tip .row { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.tip .row b { font-family: var(--font-data); font-weight: 500; font-variant-numeric: tabular-nums; }
+.notes { color: var(--fg-2); font-size: 0.9rem; max-width: 72ch; display: flex; flex-direction: column; gap: 6px; }
+.notes p { margin: 0; }
+details { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; }
+summary { cursor: pointer; font-weight: 500; }
+.tbl { overflow-x: auto; max-height: 360px; margin-top: 8px; }
+table { border-collapse: collapse; font-family: var(--font-data); font-size: 0.85rem; font-variant-numeric: tabular-nums; width: 100%; }
+th, td { text-align: right; padding: 3px 10px; border-bottom: 1px solid var(--grid); }
+th { position: sticky; top: 0; background: var(--surface); color: var(--fg-2); font-weight: 500; }
+</style>
+
+<main>
+  <header>
+    <div class="eyebrow">abc-sim · bimanual YAM · put the plastic bottles in the bin</div>
+    <h1>abc-sim Finetune Losses</h1>
+    <p class="sub">Training loss of three VLAs finetuned on the same 9 abc-sim episodes (25,155 frames at 30 fps), each on one H100 at batch 56 for about 2,000 steps. Each loss is flow-matching MSE over the 14 real joint dims.</p>
+  </header>
+  <section class="tiles" id="tiles"></section>
+  <section class="chart">
+    <div class="legend" id="legend"></div>
+    <svg id="svg" viewBox="0 0 960 440" role="img" aria-label="Training loss vs step, log scale, for GR00T N1.7, pi0.5 and DM0.5"></svg>
+    <div class="tip" id="tip" hidden></div>
+  </section>
+  <section class="notes">
+    <p><b>Comparability.</b> All three losses are velocity-target MSE in each model's own normalized action space. GR00T and DM0.5 average over the 14 real dims with padding masked out. π0.5 averages over 32 padded dims, so its curve here is loss × 32/14, an upper bound on its 14-dim MSE. The normalizations differ (GR00T min-max, π0.5 mean/std, DM0.5 quantile), so treat the curves as shapes, not exact numbers to rank.</p>
+    <p><b>Setups.</b> GR00T N1.7: full finetune of the action head and projector with the VLM frozen, 40-step chunks, LR 1e-4 with 5% warmup and cosine decay to zero at step 2,000 (33 min on the H100). π0.5: LoRA, 50-step chunks, peak LR 2.5e-5, stopped at step 2,000 with the LR still near peak. DM0.5: LoRA, 50-step chunks, LR 1e-4 with 1k warmup, also stopped near peak LR. The training losses are smoothed per logging step: each point is the mean over the previous 10 steps.</p>
+  </section>
+  <details>
+    <summary>Data table</summary>
+    <div class="tbl"><table id="tbl"></table></div>
+  </details>
+</main>
+
+<script>
+const SERIES = __DATA__;
+const css = getComputedStyle(document.documentElement);
+const color = k => `var(--s-${k})`;
+const fmt = v => v >= 0.1 ? v.toFixed(3) : v.toFixed(4);
+
+// Tiles: final logged loss per model.
+document.getElementById("tiles").innerHTML = SERIES.map(s => {
+  const [step, v] = s.data[s.data.length - 1];
+  return `<div class="tile"><div class="name"><span class="sw" style="background:${color(s.key)}"></span>${s.name}</div>
+    <div class="val">${fmt(v)}</div><div class="meta">final loss at step ${step.toLocaleString()}</div></div>`;
+}).join("");
+document.getElementById("legend").innerHTML = SERIES.map(s =>
+  `<span><span class="sw" style="background:${color(s.key)}"></span>${s.name}</span>`).join("");
+
+// Chart: log-y, linear-x.
+const W = 960, H = 440, M = { l: 56, r: 110, t: 12, b: 36 };
+const all = SERIES.flatMap(s => s.data);
+const xMax = Math.max(...all.map(d => d[0]));
+const yLo = Math.pow(10, Math.floor(Math.log10(Math.min(...all.map(d => d[1])))));
+const yHi = Math.pow(10, Math.ceil(Math.log10(Math.max(...all.map(d => d[1])))));
+const x = s => M.l + (s / xMax) * (W - M.l - M.r);
+const y = v => M.t + (1 - (Math.log10(v) - Math.log10(yLo)) / (Math.log10(yHi) - Math.log10(yLo))) * (H - M.t - M.b);
+let g = "";
+for (let e = Math.log10(yLo); e <= Math.log10(yHi); e++) {
+  for (const m of [1, 2, 5]) {
+    const v = m * Math.pow(10, e);
+    if (v < yLo || v > yHi) continue;
+    g += `<line x1="${M.l}" x2="${W - M.r}" y1="${y(v)}" y2="${y(v)}" stroke="var(--grid)" stroke-width="1"/>`;
+    g += `<text x="${M.l - 8}" y="${y(v) + 4}" text-anchor="end">${v >= 0.01 ? v : v.toExponential(0)}</text>`;
+  }
+}
+const xStep = xMax > 1500 ? 500 : 250;
+for (let s = 0; s <= xMax; s += xStep) {
+  g += `<line x1="${x(s)}" x2="${x(s)}" y1="${H - M.b}" y2="${H - M.b + 4}" stroke="var(--axis)"/>`;
+  g += `<text x="${x(s)}" y="${H - M.b + 18}" text-anchor="middle">${s.toLocaleString()}</text>`;
+}
+g += `<line x1="${M.l}" x2="${W - M.r}" y1="${H - M.b}" y2="${H - M.b}" stroke="var(--axis)"/>`;
+g += `<text x="${(M.l + W - M.r) / 2}" y="${H - 4}" text-anchor="middle">training step</text>`;
+// Direct labels at line ends, nudged apart so they never collide.
+const ends = SERIES.map(s => ({ s, yy: y(s.data[s.data.length - 1][1]) })).sort((a, b) => a.yy - b.yy);
+for (let i = 1; i < ends.length; i++) ends[i].yy = Math.max(ends[i].yy, ends[i - 1].yy + 16);
+for (const s of SERIES) {
+  const d = s.data.map((p, i) => `${i ? "L" : "M"}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join("");
+  g += `<path d="${d}" fill="none" stroke="${color(s.key)}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+  const last = s.data[s.data.length - 1];
+  g += `<circle cx="${x(last[0])}" cy="${y(last[1])}" r="4" fill="${color(s.key)}" stroke="var(--surface)" stroke-width="2"/>`;
+}
+for (const e of ends) g += `<text class="lbl" x="${W - M.r + 10}" y="${e.yy + 4}">${e.s.name.split(" (")[0]}</text>`;
+g += `<line id="xh" y1="${M.t}" y2="${H - M.b}" stroke="var(--axis)" stroke-width="1" visibility="hidden"/>`;
+g += SERIES.map(s => `<circle id="dot-${s.key}" r="4" fill="${color(s.key)}" stroke="var(--surface)" stroke-width="2" visibility="hidden"/>`).join("");
+g += `<rect id="hit" x="${M.l}" y="${M.t}" width="${W - M.l - M.r}" height="${H - M.t - M.b}" fill="transparent"/>`;
+const svg = document.getElementById("svg");
+svg.innerHTML = g;
+
+// Crosshair tooltip: nearest logged step per series.
+const tip = document.getElementById("tip");
+const near = (data, step) => data.reduce((b, p) => Math.abs(p[0] - step) < Math.abs(b[0] - step) ? p : b);
+function move(ev) {
+  const r = svg.getBoundingClientRect();
+  const sx = (ev.clientX - r.left) * W / r.width;
+  const step = Math.max(0, Math.min(xMax, (sx - M.l) / (W - M.l - M.r) * xMax));
+  const xh = document.getElementById("xh");
+  xh.setAttribute("x1", x(step)); xh.setAttribute("x2", x(step)); xh.setAttribute("visibility", "visible");
+  let rows = "";
+  for (const s of SERIES) {
+    const p = near(s.data, step), dot = document.getElementById("dot-" + s.key);
+    const ok = Math.abs(p[0] - step) <= 20;
+    dot.setAttribute("visibility", ok ? "visible" : "hidden");
+    if (ok) { dot.setAttribute("cx", x(p[0])); dot.setAttribute("cy", y(p[1])); }
+    rows += `<div class="row"><span style="display:flex;align-items:center;gap:6px"><span class="sw" style="background:${color(s.key)}"></span>${s.name}</span><b>${ok ? fmt(p[1]) : "—"}</b></div>`;
+  }
+  tip.innerHTML = `<div class="eyebrow" style="margin-bottom:4px">step ${Math.round(step / 10) * 10}</div>${rows}`;
+  tip.hidden = false;
+  const box = svg.parentElement.getBoundingClientRect();
+  let left = ev.clientX - box.left + 14;
+  if (left + tip.offsetWidth > box.width - 8) left = ev.clientX - box.left - tip.offsetWidth - 14;
+  tip.style.left = Math.max(8, left) + "px";
+  tip.style.top = (ev.clientY - box.top + 12) + "px";
+}
+const hit = document.getElementById("hit");
+hit.addEventListener("pointermove", move);
+hit.addEventListener("pointerleave", () => {
+  tip.hidden = true;
+  document.getElementById("xh").setAttribute("visibility", "hidden");
+  SERIES.forEach(s => document.getElementById("dot-" + s.key).setAttribute("visibility", "hidden"));
+});
+
+// Table view: every 100 steps.
+const steps = [...new Set(all.map(d => d[0]))].filter(s => s % 100 === 0).sort((a, b) => a - b);
+const maps = SERIES.map(s => new Map(s.data));
+document.getElementById("tbl").innerHTML =
+  `<thead><tr><th>step</th>${SERIES.map(s => `<th>${s.name}</th>`).join("")}</tr></thead><tbody>` +
+  steps.map(st => `<tr><td>${st}</td>${maps.map(m => `<td>${m.has(st) ? fmt(m.get(st)) : ""}</td>`).join("")}</tr>`).join("") + "</tbody>";
+</script>

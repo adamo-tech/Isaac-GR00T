@@ -22,7 +22,7 @@ from pathlib import Path
 
 import tyro
 
-from gr00t.configs.base_config import get_default_config
+from gr00t.configs.base_config import Config, get_default_config
 from gr00t.configs.finetune_config import FinetuneConfig
 from gr00t.experiment.experiment import run
 
@@ -41,12 +41,8 @@ def load_modality_config(modality_config_path: str):
         raise FileNotFoundError(f"Modality config path does not exist: {modality_config_path}")
 
 
-if __name__ == "__main__":
-    # Set LOGURU_LEVEL environment variable if not already set (default: INFO)
-    if "LOGURU_LEVEL" not in os.environ:
-        os.environ["LOGURU_LEVEL"] = "INFO"
-    # Use tyro for clean CLI
-    ft_config = tyro.cli(FinetuneConfig, description=__doc__)
+def build_config(ft_config: FinetuneConfig) -> Config:
+    """Turn a FinetuneConfig into the full training Config (registers the modality config)."""
     from gr00t.data.embodiment_tags import EmbodimentTag
 
     ft_config.embodiment_tag = EmbodimentTag.resolve(ft_config.embodiment_tag)
@@ -127,4 +123,13 @@ if __name__ == "__main__":
     config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint
     config.training.skip_weight_loading = ft_config.skip_weight_loading
 
-    run(config)
+    return config
+
+
+if __name__ == "__main__":
+    # Set LOGURU_LEVEL environment variable if not already set (default: INFO)
+    if "LOGURU_LEVEL" not in os.environ:
+        os.environ["LOGURU_LEVEL"] = "INFO"
+    # Use tyro for clean CLI
+    ft_config = tyro.cli(FinetuneConfig, description=__doc__)
+    run(build_config(ft_config))
