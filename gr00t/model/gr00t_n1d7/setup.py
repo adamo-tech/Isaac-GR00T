@@ -151,6 +151,32 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
     def _create_dataset(self, save_cfg_dir: Path):
         """Create appropriate dataset based on task and mode."""
+        processor = self._create_processor()
+
+        logging.debug(
+            f"Processor configs for training: {json.dumps({k: str(v) for k, v in vars(processor).items()}, indent=2)}"
+        )
+        with run_or_wait_on_rank0(label="final_processor_config.json write") as is_rank0:
+            if is_rank0:
+                with open(self.save_cfg_dir / "final_processor_config.json", "w") as f:
+                    json.dump({k: str(v) for k, v in vars(processor).items()}, f, indent=2)
+
+        self.processor = processor
+        dataset_factory = DatasetFactory(config=self.config)
+        train_dataset, eval_dataset = dataset_factory.build(processor=self.processor)
+
+        with run_or_wait_on_rank0(label="dataset_statistics.json write") as is_rank0:
+            if is_rank0:
+                stats = train_dataset.get_dataset_statistics()
+                stats_dict = convert_tensors_to_lists(stats)
+                with open(save_cfg_dir / "dataset_statistics.json", "w") as f:
+                    json.dump(stats_dict, f, indent=2)
+                logging.info("Saved dataset statistics for inference")
+
+        return train_dataset, eval_dataset
+
+    def _create_processor(self) -> Gr00tN1d7Processor:
+        """Build the processor with the model config's training overrides (no statistics yet)."""
         letter_box_transform = self.model_config.letter_box_transform
         logging.info("N1.7 letter_box_transform=%s", letter_box_transform)
         if self.config.training.start_from_checkpoint is not None:
@@ -211,28 +237,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 use_mean_std=self.model_config.use_mean_std,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
             )
-
-        logging.debug(
-            f"Processor configs for training: {json.dumps({k: str(v) for k, v in vars(processor).items()}, indent=2)}"
-        )
-        with run_or_wait_on_rank0(label="final_processor_config.json write") as is_rank0:
-            if is_rank0:
-                with open(self.save_cfg_dir / "final_processor_config.json", "w") as f:
-                    json.dump({k: str(v) for k, v in vars(processor).items()}, f, indent=2)
-
-        self.processor = processor
-        dataset_factory = DatasetFactory(config=self.config)
-        train_dataset, eval_dataset = dataset_factory.build(processor=self.processor)
-
-        with run_or_wait_on_rank0(label="dataset_statistics.json write") as is_rank0:
-            if is_rank0:
-                stats = train_dataset.get_dataset_statistics()
-                stats_dict = convert_tensors_to_lists(stats)
-                with open(save_cfg_dir / "dataset_statistics.json", "w") as f:
-                    json.dump(stats_dict, f, indent=2)
-                logging.info("Saved dataset statistics for inference")
-
-        return train_dataset, eval_dataset
+        return processor
 
     def _create_collator(self):
         data_collator = self.processor.collator
