@@ -22,7 +22,7 @@ from pathlib import Path
 import shutil
 from typing import Any
 
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 import torch
 
 from gr00t.data.types import MessageType, VLAStepData
@@ -30,9 +30,13 @@ from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7
 from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
 
 from .datum import UserError
+from .lora import LoraSettings, apply_lora, merged_state_dict
 
 
 OPTIMIZER_FILE = "optimizer.pt"
+# LoRA training checkpoints (save_weights) hold only the trainable tensors.
+ADAPTER_FILE = "trainable.safetensors"
+ADAPTER_CONFIG_FILE = "lora_config.json"
 
 
 class TrainingSession:
@@ -40,6 +44,12 @@ class TrainingSession:
 
     Gradients accumulate across ``forward_backward`` calls (each backpropagates GR00T's
     masked-mean flow-matching loss for its own batch) until ``optim_step``.
+
+    With ``lora``, the action head (DiT, VL self-attention and the trained embodiment's projector
+    slot) trains through LoRA adapters (see ``lora.py``). ``save(optimizer=True)`` then writes
+    only the trainable tensors (adapters, position embedding, ``vlln``) and the optimizer state;
+    ``save(optimizer=False)`` merges the adapters into a full checkpoint that ``Gr00tPolicy``
+    loads.
     """
 
     def __init__(
@@ -50,7 +60,13 @@ class TrainingSession:
         device: str | torch.device,
         augment: bool = True,
         bf16: bool = True,
+        lora: LoraSettings | None = None,
     ):
+        self.lora = lora
+        if lora is not None:
+            if lora.rank <= 0:
+                raise UserError("this server trains LoRA; create_model needs lora_config.rank > 0")
+            self._full_projectors = apply_lora(model, lora)
         self.device = torch.device(device)
         self.model = model.to(self.device)
         self.model.train()
@@ -124,8 +140,22 @@ class TrainingSession:
         """Write a checkpoint ``Gr00tPolicy`` can load (+ optimizer state), replacing ``path``."""
         tmp = path.with_name(f".{path.name}.tmp")
         shutil.rmtree(tmp, ignore_errors=True)
-        self.model.save_pretrained(tmp)
-        self.processor.save_pretrained(tmp)
+        if self.lora is not None and optimizer:
+            tmp.mkdir(parents=True)
+            trainable = {
+                name: p.detach().contiguous()
+                for name, p in self.model.named_parameters()
+                if p.requires_grad
+            }
+            save_file(trainable, tmp / ADAPTER_FILE)
+            (tmp / ADAPTER_CONFIG_FILE).write_text(json.dumps(self.lora.to_json()))
+        elif self.lora is not None:
+            state = merged_state_dict(self.model, self._full_projectors, self.lora.embodiment_id)
+            self.model.save_pretrained(tmp, state_dict=state)
+            self.processor.save_pretrained(tmp)
+        else:
+            self.model.save_pretrained(tmp)
+            self.processor.save_pretrained(tmp)
         if optimizer:
             torch.save(
                 {"optimizer": self.optimizer.state_dict(), "step": self.step}, tmp / OPTIMIZER_FILE
@@ -135,6 +165,43 @@ class TrainingSession:
 
     def load(self, path: Path, *, optimizer: bool) -> None:
         """Load weights saved by ``save`` (or any GR00T checkpoint of this architecture)."""
+        if self.lora is not None:
+            self._load_trainable(path)
+        else:
+            self._load_full(path)
+        if optimizer:
+            if not (path / OPTIMIZER_FILE).exists():
+                raise UserError(f"{path} has no optimizer state (saved for sampler?)")
+            saved = torch.load(path / OPTIMIZER_FILE, map_location=self.device, weights_only=True)
+            self.optimizer.load_state_dict(saved["optimizer"])
+            self.step = saved["step"]
+        self.optimizer.zero_grad(set_to_none=True)
+
+    def _load_trainable(self, path: Path) -> None:
+        if not (path / ADAPTER_FILE).exists():
+            raise UserError(
+                f"{path} is not a LoRA training checkpoint (no {ADAPTER_FILE}); "
+                "a LoRA model loads only checkpoints from save_weights"
+            )
+        saved = json.loads((path / ADAPTER_CONFIG_FILE).read_text())
+        if saved != self.lora.to_json():
+            raise UserError(f"{path} was saved with LoRA {saved}, this model uses {self.lora}")
+        state = load_file(path / ADAPTER_FILE)
+        params = {name: p for name, p in self.model.named_parameters() if p.requires_grad}
+        missing = sorted(set(params) - set(state))
+        unexpected = sorted(set(state) - set(params))
+        if missing or unexpected:
+            raise UserError(
+                f"{path} does not match the model: {len(missing)} missing keys "
+                f"{missing[:5]}, {len(unexpected)} unexpected keys {unexpected[:5]}"
+            )
+        with torch.no_grad():
+            for name, p in params.items():
+                if state[name].shape != p.shape:
+                    raise UserError(f"{path}: {name} has shape {list(state[name].shape)}")
+                p.copy_(state[name])
+
+    def _load_full(self, path: Path) -> None:
         index = path / "model.safetensors.index.json"
         if index.exists():
             files = sorted(set(json.loads(index.read_text())["weight_map"].values()))
@@ -160,10 +227,3 @@ class TrainingSession:
                 f"{path} does not match the model: {len(missing)} missing keys "
                 f"{missing[:5]}, {len(unexpected)} unexpected keys {unexpected[:5]}"
             )
-        if optimizer:
-            if not (path / OPTIMIZER_FILE).exists():
-                raise UserError(f"{path} has no optimizer state (saved for sampler?)")
-            saved = torch.load(path / OPTIMIZER_FILE, map_location=self.device, weights_only=True)
-            self.optimizer.load_state_dict(saved["optimizer"])
-            self.step = saved["step"]
-        self.optimizer.zero_grad(set_to_none=True)

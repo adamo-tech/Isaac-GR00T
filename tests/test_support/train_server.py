@@ -41,6 +41,7 @@ STATE_DIMS = {"arm": 5, "gripper": 1}
 CAMERAS = ["ego_view", "wrist"]
 API_KEY = "ak_test_key"
 EMBED_DIM = 64
+SLOT = 2  # projector slot of TAG, out of max_num_embodiments=4
 
 MODALITY_CONFIG = {
     "video": ModalityConfig(delta_indices=[0], modality_keys=CAMERAS),
@@ -117,9 +118,12 @@ class FakeBackbone:
         )
 
 
-def make_session(seed: int | None = None):
+def make_session(seed: int | None = None, lora_rank: int = 0, *, lora: bool = False, **lora_kw):
+    """``lora_rank`` is create_model's lora_config.rank; it and ``lora_kw`` (more LoraSettings
+    fields) are used only with ``lora``."""
     from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7
     from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
+    from gr00t.train_server.lora import LoraSettings
     from gr00t.train_server.session import TrainingSession
 
     if seed is not None:
@@ -171,10 +175,13 @@ def make_session(seed: int | None = None):
             shortest_image_edge=32,
             crop_fraction=0.95,
             use_relative_action=True,
-            embodiment_id_mapping={TAG.value: 0},
+            embodiment_id_mapping={TAG.value: SLOT},
         )
     processor.set_statistics({TAG.value: STATISTICS}, override=True)
-    return TrainingSession(model, processor, device="cpu", augment=False)
+    settings = None
+    if lora:
+        settings = LoraSettings(rank=lora_rank, alpha=2 * lora_rank, embodiment_id=SLOT, **lora_kw)
+    return TrainingSession(model, processor, device="cpu", augment=False, lora=settings)
 
 
 def png_b64(rng: np.random.Generator, size: int = 32) -> str:

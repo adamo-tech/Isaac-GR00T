@@ -14,20 +14,29 @@ max_containers=1 keeps every request on the container that holds the model in me
   modal deploy modal/gr00t_train.py
   # base URL: https://<workspace>--gr00t-train.modal.run (printed by deploy)
 
+  # LoRA variant, a separate app (gr00t-train-lora) with its own checkpoint Volume:
+  GR00T_TRAIN_LORA=1 modal deploy modal/gr00t_train.py
+  # base URL: https://<workspace>--gr00t-train-lora.modal.run
+
 Weights come from the gr00t-assets Volume (shared with gr00t_infer.py); checkpoints go to
 the gr00t-train-checkpoints Volume, committed after every save, so they outlive the
 container. Normalization stats are abc_sim_statistics.json next to this file, exported from
 the abc-sim GR00T dataset; swap EMBODIMENT_TAG, MODALITY_CONFIG and STATS for another robot.
 """
 
+import os
 from pathlib import Path
 
 import modal
 
 
-app = modal.App("gr00t-train")
+# Set at deploy time and baked into the image, so the container sees the same value.
+LORA = os.environ.get("GR00T_TRAIN_LORA") == "1"  # LoRA on the action head, rank from create_model
+NAME = "gr00t-train-lora" if LORA else "gr00t-train"
+
+app = modal.App(NAME)
 assets = modal.Volume.from_name("gr00t-assets", create_if_missing=True)
-checkpoints = modal.Volume.from_name("gr00t-train-checkpoints", create_if_missing=True)
+checkpoints = modal.Volume.from_name(f"{NAME}-checkpoints", create_if_missing=True)
 
 LOCAL = Path(__file__).resolve().parents[1]
 REPO = "/opt/gr00t"
@@ -40,6 +49,10 @@ BACKBONE = "nvidia/Cosmos-Reason2-2B"
 EMBODIMENT_TAG = "new_embodiment"
 MODALITY_CONFIG = f"{REPO}/runpod/abc_sim/abc_sim_config.py"
 STATS = f"{REPO}/modal/abc_sim_statistics.json"
+# With LORA: start the projector slot from xdof's pretrained bimanual slot, abc-sim keys placed at
+# xdof's gripper/joint dims (None starts from new_embodiment's untrained slot).
+PROJECTOR_INIT_TAG = "xdof"
+PROJECTOR_INIT_LAYOUT = "left_arm=20,left_gripper=18,right_arm=26,right_gripper=19"
 
 IDLE_SECONDS = 180  # shut the H100 down after 3 minutes without a request
 
@@ -66,6 +79,7 @@ image = (
         " --index-strategy unsafe-best-match",
     )
     .env({"HF_HOME": HF_HOME, "PYTHONPATH": REPO, "TOKENIZERS_PARALLELISM": "false"})
+    .env({"GR00T_TRAIN_LORA": "1"} if LORA else {})
     .add_local_dir(LOCAL / "gr00t", f"{REPO}/gr00t", ignore=["**/__pycache__", "eval/sim/**"])
     .add_local_file(LOCAL / "runpod/abc_sim/abc_sim_config.py", MODALITY_CONFIG)
     .add_local_file(LOCAL / "modal/abc_sim_statistics.json", STATS)
@@ -95,10 +109,8 @@ def download(hf_token: str = "") -> None:
     startup_timeout=900,
 )
 @modal.concurrent(max_inputs=256)
-@modal.asgi_app(label="gr00t-train")
+@modal.asgi_app(label=NAME)
 def serve():
-    import os
-
     # Weights come off the Volume; never reach for the hub. GROOT_PATCH_MISTRAL skips
     # transformers' Mistral-tokenizer probe, which also goes to the hub.
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -114,6 +126,9 @@ def serve():
         modality_config_path=MODALITY_CONFIG,
         checkpoint_dir=CHECKPOINTS,
         replace_model=True,
+        lora=LORA,
+        projector_init_tag=PROJECTOR_INIT_TAG if LORA else None,
+        projector_init_layout=PROJECTOR_INIT_LAYOUT if LORA else None,
     )
     spec, create_session = build(cfg)
     return create_app(

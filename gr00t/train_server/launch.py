@@ -28,6 +28,11 @@ either a GR00T LeRobot dataset directory (stats and relative-action stats are co
 cached in its ``meta/`` the same way fine-tuning does) or a JSON file in GR00T's statistics
 format, ``{"state": ..., "action": ..., "relative_action": ...}``, optionally nested under the
 embodiment tag (e.g. a checkpoint's ``statistics.json``).
+
+With ``--lora``, the diffusion model, VL self-attention and the embodiment's projector slot train
+through LoRA adapters of the rank each ``create_model`` asks for (``lora_config.rank``); the
+other embodiments' projector slots are dropped from the device. Without it,
+``lora_config.rank`` is ignored.
 """
 
 from dataclasses import dataclass
@@ -54,6 +59,7 @@ from gr00t.model.gr00t_n1d7.setup import Gr00tN1d7Pipeline
 
 from .app import create_app
 from .datum import EmbodimentSpec
+from .lora import LoraSettings
 from .session import TrainingSession
 
 
@@ -94,6 +100,21 @@ class ServerConfig:
 
     device: str = "cuda"
 
+    lora: bool = False
+    """Train the action head through LoRA (rank from create_model's lora_config)."""
+
+    lora_alpha: float | None = None
+    """LoRA alpha; None uses 2 * rank."""
+
+    lora_dropout: float = 0.0
+
+    projector_init_tag: str | None = None
+    """With --lora: start the projector slot from this (pretrained) embodiment's slot, e.g. xdof."""
+
+    projector_init_layout: str | None = None
+    """With --projector-init-tag: where each of your state/action keys starts in that
+    embodiment's padded layout, e.g. "left_arm=20,left_gripper=18,right_arm=26,right_gripper=19"."""
+
 
 def load_statistics(stats: str, tag: EmbodimentTag, config: Config) -> dict[str, Any]:
     path = Path(stats)
@@ -116,6 +137,22 @@ def load_statistics(stats: str, tag: EmbodimentTag, config: Config) -> dict[str,
     return loaded.get(tag.value, loaded)
 
 
+def layout_maps(spec: EmbodimentSpec, layout: str) -> tuple[list[int], list[int]]:
+    """``state_map``/``action_map`` for LoraSettings from ``"key=offset,..."``."""
+    offsets = {}
+    for item in layout.split(","):
+        key, _, offset = item.partition("=")
+        offsets[key.strip()] = int(offset)
+
+    def index_map(dims: dict[str, int]) -> list[int]:
+        missing = [k for k in dims if k not in offsets]
+        if missing:
+            raise SystemExit(f"--projector-init-layout has no offset for {missing}")
+        return [offsets[k] + i for k, dim in dims.items() for i in range(dim)]
+
+    return index_map(spec.state_dims), index_map(spec.action_dims)
+
+
 def build(cfg: ServerConfig):
     """Return (spec, create_session) for create_app."""
     ft = FinetuneConfig(
@@ -131,8 +168,14 @@ def build(cfg: ServerConfig):
     modality_config = config.data.modality_configs[tag.value]
     statistics = load_statistics(cfg.stats, tag, config)
     spec = EmbodimentSpec.from_modality_config(tag, modality_config, statistics)
+    init_tag = state_map = action_map = None
+    if cfg.projector_init_tag is not None:
+        if not cfg.lora or cfg.projector_init_layout is None:
+            raise SystemExit("--projector-init-tag needs --lora and --projector-init-layout")
+        init_tag = EmbodimentTag.resolve(cfg.projector_init_tag)
+        state_map, action_map = layout_maps(spec, cfg.projector_init_layout)
 
-    def create_session(seed: int | None) -> TrainingSession:
+    def create_session(seed: int | None, lora_rank: int = 0) -> TrainingSession:
         # A replaced model's session has just been dropped; give its GPU memory back first.
         gc.collect()
         if torch.cuda.is_available():
@@ -148,12 +191,26 @@ def build(cfg: ServerConfig):
         model = pipeline._create_model()
         processor = pipeline._create_processor()
         processor.set_statistics({tag.value: statistics}, override=True)
+        lora = None
+        if cfg.lora:
+            lora = LoraSettings(
+                rank=lora_rank,
+                alpha=cfg.lora_alpha if cfg.lora_alpha is not None else 2 * lora_rank,
+                embodiment_id=processor.embodiment_id_mapping[tag.value],
+                dropout=cfg.lora_dropout,
+                init_slot=(
+                    None if init_tag is None else processor.embodiment_id_mapping[init_tag.value]
+                ),
+                state_map=state_map,
+                action_map=action_map,
+            )
         return TrainingSession(
             model,
             processor,
             device=cfg.device,
             augment=cfg.augment,
             bf16=config.training.bf16,
+            lora=lora,
         )
 
     return spec, create_session

@@ -2,9 +2,10 @@
 
 A FastAPI server that fine-tunes GR00T N1.7 through Tinker-style calls: one process, one GPU,
 one model. It reuses GR00T's own model loading (as `launch_finetune.py`), processor (image
-transforms, tokenization, normalization, relative actions) and flow-matching loss. It is a
-full fine-tune of the projector and diffusion action head with the VLM frozen, not LoRA;
-`lora_config.rank` is accepted and ignored, `lora_config.seed` seeds the run.
+transforms, tokenization, normalization, relative actions) and flow-matching loss. The VLM is
+always frozen. By default it is a full fine-tune of the projector and diffusion action head, and
+`lora_config.rank` is accepted and ignored. With `--lora` the action head trains through LoRA
+adapters instead (see [LoRA](#lora)). `lora_config.seed` seeds the run either way.
 
 ## Requirements
 
@@ -236,6 +237,62 @@ GR00T_TRAIN_API_KEY=ak_... uv run python -m gr00t.train_server.launch \
 | `--augment` / `--no-augment` | on | GR00T's training-time augmentation (image crop/jitter, processor state dropout). |
 | `--state-dropout-prob` | `0.2` | Same default as `launch_finetune.py`. |
 | `--device` | `cuda` | Torch device. |
+| `--lora` / `--no-lora` | off | Train the action head (DiT, VL self-attention, embodiment projector slot) through LoRA, rank from `create_model` (see [LoRA](#lora)). |
+| `--lora-alpha` | `2 * rank` | LoRA alpha. |
+| `--lora-dropout` | `0.0` | LoRA dropout. |
+| `--projector-init-tag` | none | With `--lora`: start the projector slot from this embodiment's slot, e.g. `xdof`. |
+| `--projector-init-layout` | none | With `--projector-init-tag`: `key=offset,...`, where each of your keys starts in that embodiment's padded layout. |
+
+## LoRA
+
+With `--lora`, the action head trains through LoRA adapters of rank `lora_config.rank` (which
+must be > 0). The VLM stays frozen, as without LoRA.
+
+- **Projectors.** GR00T's state encoder, action encoder and action decoder hold one weight slot
+  per embodiment (`CategorySpecificLinear`, 32 slots). Only your embodiment's slot is kept on the
+  GPU, as a plain `nn.Linear`; the other 31 slots are removed from the network (parked on the
+  CPU, to rebuild the full layout at save time). That slot gets LoRA adapters like any other
+  linear layer. For `new_embodiment` it is slot 10, which in `nvidia/GR00T-N1.7-3B` is still at
+  its random initialization, so the adapters learn the embodiment mapping on top of a fixed
+  random projection.
+- **Starting from a pretrained slot.** `--projector-init-tag xdof` starts from another
+  embodiment's pretrained slot instead (xdof is slot 27). Its padded state/action vectors are
+  laid out differently, so `--projector-init-layout` says where each of your keys starts in that
+  layout, and the slot's input rows (state and action encoders) and output columns (action
+  decoder) are permuted to match yours. The trained slot is still saved into your embodiment's
+  own slot (10), so inference uses the `new_embodiment` tag as usual and slot 27 is unchanged.
+  xdof's layout (state and action): left EEF 0-8, right EEF 9-17, left gripper 18, right
+  gripper 19, left joints 20-25, right joints 26-31. For abc-sim (6 joints + 1 gripper per arm,
+  like xdof):
+
+  ```bash
+  --lora --projector-init-tag xdof \
+      --projector-init-layout left_arm=20,left_gripper=18,right_arm=26,right_gripper=19
+  ```
+
+  The xdof EEF dims get no input (they map to your padding). Joint order, sign and gripper
+  convention should match xdof's for the pretrained weights to help.
+- **DiT and VL self-attention.** Every `nn.Linear` gets an adapter; base weights are frozen.
+- **Still trained in full:** the position embedding and `vlln` (1.6 M parameters).
+
+On N1.7-3B at rank 32 that is 40.8 M trainable parameters (39.2 M LoRA, of which 33.9 M in the
+DiT and 4.7 M in the VL self-attention), and about 300 M fewer parameters on the GPU.
+
+Checkpoints change as follows:
+
+- `save_weights` writes only the trainable tensors to `trainable.safetensors` (156 MB at
+  rank 32), plus `lora_config.json` and `optimizer.pt` (311 MB). It holds no base weights
+  and no processor.
+- `save_weights_for_sampler` merges the adapters into the base weights, writes the projector
+  slot back into the 32-slot tensors (other slots unchanged), and saves a normal full checkpoint
+  that `Gr00tPolicy` loads directly.
+- `load_weights` accepts only `save_weights` checkpoints from a LoRA model with the same rank,
+  alpha, dropout, embodiment slot and projector init, on top of the same `--base-model-path`.
+
+On Modal, `GR00T_TRAIN_LORA=1 modal deploy modal/gr00t_train.py` deploys the LoRA server as a
+separate app, `gr00t-train-lora` (base URL `https://<workspace>--gr00t-train-lora.modal.run`),
+with its own `gr00t-train-lora-checkpoints` Volume. It starts from the xdof slot; set
+`PROJECTOR_INIT_TAG = None` in the file to start from `new_embodiment`'s own slot.
 
 ## Stats
 
@@ -257,7 +314,7 @@ The stats are also written into every checkpoint (`statistics.json`), so `Gr00tP
 | `create_model` | `base_model: "nvidia/GR00T-N1.7"`, `lora_config {rank, seed}`, `session_id?`, `model_seq_id?`, `user_metadata?` | `{"type": "create_model", "model_id"}` |
 | `forward_backward` | `model_id`, `seq_id`, `forward_backward_input {data, loss_fn: "flow_matching"}` | `{"type": "forward_backward", "loss_fn_output_type": "ArrayRecord", "loss_fn_outputs": [{"loss": TensorData}], "metrics": {"loss:mean"}}` |
 | `optim_step` | `model_id`, `seq_id`, `adam_params {learning_rate, beta1, beta2, eps, weight_decay, grad_clip_norm}` | `{"type": "optim_step", "metrics": {"grad_norm", "learning_rate", "step"}}` |
-| `save_weights` | `model_id`, `seq_id`, `path` (name), `ttl_seconds` (ignored) | `{"type": "save_weights", "path"}`: weights + processor/stats + `optimizer.pt` |
+| `save_weights` | `model_id`, `seq_id`, `path` (name), `ttl_seconds` (ignored) | `{"type": "save_weights", "path"}`: weights + processor/stats + `optimizer.pt` (with `--lora`: trainable tensors + `optimizer.pt` only) |
 | `save_weights_for_sampler` | same | `{"type": "save_weights_for_sampler", "path"}`: weights + processor/stats (loads in `Gr00tPolicy`) |
 | `load_weights` | `model_id`, `seq_id`, `path` (name or absolute dir), `optimizer` | `{"type": "load_weights", "path"}` |
 | `get_info` | `model_id` | synchronous: `{"model_id", "model_data": {"base_model", "action_horizon", "image_names", "state_names", "action_names", "state_dims", "action_dims"}}` |

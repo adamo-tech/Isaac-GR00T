@@ -15,6 +15,7 @@
 
 """End-to-end test of the Tinker-protocol training server on a tiny CPU model."""
 
+from functools import partial
 import time
 
 from fastapi.testclient import TestClient
@@ -26,13 +27,13 @@ from test_support.train_server import API_KEY, HORIZON, make_datum, make_session
 HEADERS = {"X-API-Key": API_KEY}
 
 
-def make_client(tmp_path, **kwargs):
+def make_client(tmp_path, create_session=make_session, **kwargs):
     from gr00t.train_server.app import create_app
 
     app = create_app(
         api_key=API_KEY,
         spec=make_spec(),
-        create_session=make_session,
+        create_session=create_session,
         checkpoint_dir=tmp_path / "checkpoints",
         **kwargs,
     )
@@ -203,3 +204,21 @@ def test_new_create_model_replaces_the_old_one(tmp_path):
         save = post(client, "save_weights_for_sampler", {"model_id": new, "seq_id": 2, "path": "s"})
         assert wait(client, save["request_id"])["type"] == "save_weights_for_sampler"
         assert saved == [tmp_path / "checkpoints" / "s"]
+
+
+def test_lora_server_needs_a_rank_and_saves_adapters(tmp_path):
+    with make_client(tmp_path, create_session=partial(make_session, lora=True)) as client:
+        body = {"base_model": "nvidia/GR00T-N1.7", "lora_config": {"rank": 0}}
+        error = wait(client, post(client, "create_model", body)["request_id"])
+        assert error["category"] == "user" and "rank" in error["error"]
+
+    with make_client(
+        tmp_path, create_session=partial(make_session, lora=True), replace_model=True
+    ) as client:
+        model_id = create_model(client)
+        save = {"model_id": model_id, "seq_id": 1, "path": "lora"}
+        assert wait(client, post(client, "save_weights", save)["request_id"])["type"] == (
+            "save_weights"
+        )
+        assert (tmp_path / "checkpoints" / "lora" / "trainable.safetensors").exists()
+        assert not (tmp_path / "checkpoints" / "lora" / "model.safetensors").exists()

@@ -112,13 +112,13 @@ def create_app(
     *,
     api_key: str,
     spec: EmbodimentSpec,
-    create_session: Callable[[int | None], TrainingSession],
+    create_session: Callable[[int | None, int], TrainingSession],
     checkpoint_dir: str | Path,
     first_seq_id: int = 1,
     replace_model: bool = False,
     on_save: Callable[[Path], None] | None = None,
 ) -> FastAPI:
-    """Build the app. ``create_session(seed)`` loads the model; it runs on the GPU worker.
+    """Build the app. ``create_session(seed, lora_rank)`` loads the model on the GPU worker.
 
     The server holds one model. With ``replace_model``, a new ``create_model`` replaces it (the
     old model's calls then fail); otherwise a second ``create_model`` is refused. ``on_save``
@@ -210,8 +210,8 @@ def create_app(
                 if current:
                     old = current.pop()
                     scheduler.retire(old, f"model {old} was replaced by a newer create_model")
-                seed = body.lora_config.seed
-                future = scheduler.create_model(lambda: create_session(seed))
+                seed, rank = body.lora_config.seed, body.lora_config.rank
+                future = scheduler.create_model(lambda: create_session(seed, rank))
                 request_id, model_id = created[key] = (future.request_id, future.model_id)
                 current.append(model_id)
         return {"request_id": request_id, "model_id": model_id}
