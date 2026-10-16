@@ -3,8 +3,14 @@
 Adapted from openpi/examples/abc_sim/adamo_client.py (same protocol), with the openpi websocket call
 replaced by Gr00tPolicy.get_action. Needs adamo[video]>=1.0.9 (announce_control) in the GR00T venv.
 
-    ADAMO_API_KEY=... python runpod/abc_sim/adamo_bridge.py --model-path <checkpoint-2000> --robot abc-inference
-    python runpod/abc_sim/adamo_bridge.py --model-path <checkpoint-2000> --warmup-only   # no robot, no control
+    ADAMO_API_KEY=... python -m runpod.abc_sim.adamo_bridge --model-path <checkpoint-2000> --robot abc-inference
+    python -m runpod.abc_sim.adamo_bridge --model-path <checkpoint-2000> --warmup-only   # no robot, no control
+
+With --engine-dir the policy runs on FastGr00t (scripts/deployment/fast: TRT backbone + compiled action
+head in one CUDA graph, ~20 ms on an RTX 4090), optionally with a training-server LoRA merged in:
+
+    python -m runpod.abc_sim.adamo_bridge --model-path <base weights + abc-sim processor> \
+        --lora-dir <LoRA dir> --engine-dir trt_fast/engines --robot abc-sim
 
 It claims the robot the way operate.adamohq.com does (acquired, then a heartbeat a second on
 {robot}/control/json/operator_control) and, while in control, holds the {robot}/operator/active/policy/{sessionId}
@@ -29,6 +35,7 @@ import uuid
 import numpy as np
 from PIL import Image
 import tyro
+
 
 logger = logging.getLogger("adamo_bridge")
 
@@ -57,6 +64,10 @@ class Args:
     robot: str = "abc-inference"
     prompt: str = "sim put the plastic bottles in the bin"
     embodiment_tag: str = "new_embodiment"
+    lora_dir: str | None = None
+    """Training-server LoRA (trainable.safetensors + lora_config.json), merged into the weights."""
+    engine_dir: str | None = None
+    """FastGr00t engines (scripts/deployment/fast/build_engines.py, 224x224); None runs eager Gr00tPolicy."""
     control_hz: float = 30.0
     execute_steps: int = 20
     """Actions executed from each 40-step chunk before the next one takes over."""
@@ -86,14 +97,20 @@ class Policy:
     """Gr00tPolicy wrapped to take a 14-d state and 224x224 images and return a (40, 14) chunk."""
 
     def __init__(self, args: Args) -> None:
+        from scripts.deployment.fast.lora import load_lora_policy
         import torch
 
-        from gr00t.policy.gr00t_policy import Gr00tPolicy
-
-        self.policy = Gr00tPolicy(args.embodiment_tag, args.model_path, device="cuda", strict=True)
+        self.policy, _ = load_lora_policy(
+            args.model_path, args.lora_dir, args.embodiment_tag, strict=True
+        )
         self.language_key = self.policy.language_key
         self.prompt = args.prompt
         self._torch = torch
+        self.fast = None
+        if args.engine_dir is not None:
+            from scripts.deployment.fast.fast_gr00t import FastGr00t
+
+            self.fast = FastGr00t(self.policy, args.engine_dir, H=224, W=224)
 
     def __call__(self, images: dict[str, np.ndarray], state: np.ndarray) -> np.ndarray:
         obs = {
@@ -101,10 +118,10 @@ class Policy:
             "state": {g: state[None, None, s].astype(np.float32) for g, s in GROUPS.items()},
             "language": {self.language_key: [[self.prompt]]},
         }
-        action, _ = self.policy.get_action(obs)
+        action = self.fast.get_action(obs) if self.fast else self.policy.get_action(obs)[0]
         return np.concatenate([action[g][0] for g in GROUPS], axis=-1).astype(np.float32)
 
-    def warmup(self, n: int = 5) -> list[float]:
+    def warmup(self, n: int = 20) -> list[float]:
         rng = np.random.default_rng(0)
         images = {k: rng.integers(0, 255, (224, 224, 3), dtype=np.uint8) for k in CAMERAS}
         state = np.zeros(14, dtype=np.float32)
@@ -157,20 +174,28 @@ class Bridge:
         self.frames = {key: Latest() for key in CAMERAS}
         self.state = Latest()
         self._receivers = {
-            key: self.session.video_receiver(self.robot, track, max_queued_frames=1) for key, track in CAMERAS.items()
+            key: self.session.video_receiver(self.robot, track, max_queued_frames=1)
+            for key, track in CAMERAS.items()
         }
         self._state_sub = self.session.subscribe(
-            args.state_topic.format(robot=self.robot), callback=lambda s: self.state.set(decode_joints(bytes(s.payload)))
+            args.state_topic.format(robot=self.robot),
+            callback=lambda s: self.state.set(decode_joints(bytes(s.payload))),
         )
         self._control_pub = self.session.publisher(
             args.control_topic.format(robot=self.robot), priority=Priority.REAL_TIME, express=True
         )
 
-        self.operator = {"userId": "gr00t-policy", "sessionId": uuid.uuid4().hex, "displayName": "GR00T N1.7 policy"}
+        self.operator = {
+            "userId": "gr00t-policy",
+            "sessionId": uuid.uuid4().hex,
+            "displayName": "GR00T N1.7 policy",
+        }
         self.in_control = False
         self._announcement = None  # adamo.ControlAnnouncement while in control
         ownership_topic = f"{self.robot}/control/json/operator_control"
-        self._ownership_pub = self.session.publisher(ownership_topic, priority=Priority.DATA_HIGH, reliable=True)
+        self._ownership_pub = self.session.publisher(
+            ownership_topic, priority=Priority.DATA_HIGH, reliable=True
+        )
         self._ownership_sub = self.session.subscribe(ownership_topic, callback=self._on_ownership)
 
         self._lock = threading.Lock()  # guards chunk, chunk_start, step and in_control
@@ -193,7 +218,9 @@ class Bridge:
                 if self.stop.wait(0.5):
                     return
                 self._receivers[key].close()
-                self._receivers[key] = self.session.video_receiver(self.robot, CAMERAS[key], max_queued_frames=1)
+                self._receivers[key] = self.session.video_receiver(
+                    self.robot, CAMERAS[key], max_queued_frames=1
+                )
                 continue
             rgb = np.asarray(frame.rgba)[..., :3]
             if CAMERAS[key] in STEREO_TRACKS:
@@ -280,7 +307,9 @@ class Bridge:
             with self._lock:
                 if self._chunk is not None and self.in_control:
                     idx = min(self._step - self._chunk_start, len(self._chunk) - 1)
-                    msg = self.adamo.JointState(names=JOINT_NAMES, positions=self._chunk[idx].tolist())
+                    msg = self.adamo.JointState(
+                        names=JOINT_NAMES, positions=self._chunk[idx].tolist()
+                    )
                     self._control_pub.put(msg.to_json())
                     self._step += 1
                     self.published += 1
@@ -295,12 +324,19 @@ class Bridge:
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, lambda *_: self.stop.set())
         self._publish_ownership("acquired", active=True)
-        self._announcement = self.session.announce_control(self.robot, "policy", self.operator["sessionId"])
+        self._announcement = self.session.announce_control(
+            self.robot, "policy", self.operator["sessionId"]
+        )
         with self._lock:
             self.in_control = True
         logger.warning("acquired %s as %s", self.robot, self.operator)
-        threads = [threading.Thread(target=self._camera_loop, args=(key,), daemon=True) for key in CAMERAS]
-        threads += [threading.Thread(target=f, daemon=True) for f in (self._inference_loop, self._control_loop)]
+        threads = [
+            threading.Thread(target=self._camera_loop, args=(key,), daemon=True) for key in CAMERAS
+        ]
+        threads += [
+            threading.Thread(target=f, daemon=True)
+            for f in (self._inference_loop, self._control_loop)
+        ]
         threads.append(threading.Thread(target=self._heartbeat_loop, daemon=True))
         for t in threads:
             t.start()
@@ -316,7 +352,10 @@ class Bridge:
                     round(float(np.mean(ms))) if ms else None,
                     self.published,
                 )
-                if self.args.max_seconds is not None and time.monotonic() - t_start > self.args.max_seconds:
+                if (
+                    self.args.max_seconds is not None
+                    and time.monotonic() - t_start > self.args.max_seconds
+                ):
                     logger.warning("max_seconds reached")
                     break
         finally:
