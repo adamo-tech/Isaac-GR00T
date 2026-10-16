@@ -16,6 +16,7 @@
 """End-to-end test of the Tinker-protocol training server on a tiny CPU model."""
 
 from functools import partial
+import threading
 import time
 
 from fastapi.testclient import TestClient
@@ -222,3 +223,34 @@ def test_lora_server_needs_a_rank_and_saves_adapters(tmp_path):
         )
         assert (tmp_path / "checkpoints" / "lora" / "trainable.safetensors").exists()
         assert not (tmp_path / "checkpoints" / "lora" / "model.safetensors").exists()
+
+
+def test_retrieve_future_holds_until_the_call_is_done(tmp_path):
+    release = threading.Event()
+
+    def slow_session(*args):
+        release.wait(10)
+        return make_session(*args)
+
+    body = {"base_model": "nvidia/GR00T-N1.7", "lora_config": {"rank": 32, "seed": 0}}
+    with make_client(tmp_path, create_session=slow_session, poll_seconds=0.2) as client:
+        created = post(client, "create_model", body)
+        started = time.monotonic()
+        assert (
+            post(client, "retrieve_future", {"request_id": created["request_id"]})["type"]
+            == "try_again"
+        )
+        assert time.monotonic() - started >= 0.2
+        release.set()
+
+    release.clear()
+    with make_client(tmp_path, create_session=slow_session, poll_seconds=10.0) as client:
+        created = post(client, "create_model", body)
+        threading.Timer(0.3, release.set).start()
+        started = time.monotonic()
+        # One request: the server answers as soon as the model exists, not after the hold.
+        assert post(client, "retrieve_future", {"request_id": created["request_id"]}) == {
+            "type": "create_model",
+            "model_id": created["model_id"],
+        }
+        assert 0.3 <= time.monotonic() - started < 5.0

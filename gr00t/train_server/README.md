@@ -318,7 +318,7 @@ The stats are also written into every checkpoint (`statistics.json`), so `Gr00tP
 | `save_weights_for_sampler` | same | `{"type": "save_weights_for_sampler", "path"}`: weights + processor/stats (loads in `Gr00tPolicy`) |
 | `load_weights` | `model_id`, `seq_id`, `path` (name or absolute dir), `optimizer` | `{"type": "load_weights", "path"}` |
 | `get_info` | `model_id` | synchronous: `{"model_id", "model_data": {"base_model", "action_horizon", "image_names", "state_names", "action_names", "state_dims", "action_dims"}}` |
-| `retrieve_future` | `request_id` | `{"type": "try_again", ...}`, the result, or `{"error", "category"}` |
+| `retrieve_future` | `request_id` | synchronous: the result or `{"error", "category"}` once the call is done, or `{"type": "try_again", ...}` if it is still running after 20 s |
 
 Every other call answers `{"request_id", "model_id"}` immediately.
 

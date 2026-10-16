@@ -17,10 +17,12 @@
 
 Submissions are validated synchronously: a 4xx means nothing was queued and the seq_id is
 still free. Accepted calls return ``{"request_id", "model_id"}`` at once and run on the
-scheduler's worker; ``/retrieve_future`` returns ``try_again`` until the result (or
-``{"error", "category"}``) is ready.
+scheduler's worker. ``/retrieve_future`` holds the request until the result (or
+``{"error", "category"}``) is ready, for up to ``poll_seconds``, then returns ``try_again``; a
+client waiting on a call then makes one request per result rather than one per backoff step.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 import secrets
@@ -38,6 +40,10 @@ from .session import TrainingSession
 
 
 BASE_MODEL = "nvidia/GR00T-N1.7"
+POLL_SECONDS = 20.0
+"""How long ``/retrieve_future`` holds a request for an unfinished call, well inside the
+per-request timeouts of Modal and the proxies in front of it."""
+POLL_INTERVAL = 0.02
 
 
 class ApiError(Exception):
@@ -117,6 +123,7 @@ def create_app(
     first_seq_id: int = 1,
     replace_model: bool = False,
     on_save: Callable[[Path], None] | None = None,
+    poll_seconds: float = POLL_SECONDS,
 ) -> FastAPI:
     """Build the app. ``create_session(seed, lora_rank)`` loads the model on the GPU worker.
 
@@ -299,10 +306,16 @@ def create_app(
         }
 
     @app.post(f"{v1}/retrieve_future", dependencies=auth)
-    def retrieve_future(body: RetrieveFutureRequest):
+    async def retrieve_future(body: RetrieveFutureRequest):
         future = scheduler.get(body.request_id)
         if future is None:
             raise ApiError(404, f"unknown request_id {body.request_id!r}")
+        # Checked on the event loop rather than waited on in a threadpool thread, so held
+        # polls never use up the threads that submissions run on.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + poll_seconds
+        while not future.done and loop.time() < deadline:
+            await asyncio.sleep(POLL_INTERVAL)
         if not future.done:
             return {"type": "try_again", "request_id": future.request_id, "queue_state": "active"}
         if future.error is not None:
