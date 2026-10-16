@@ -157,8 +157,11 @@ def create_app(
         if not scheduler.has_model(model_id):
             raise ApiError(404, f"unknown model_id {model_id!r}")
 
-    def submit(model_id, seq_id, description, validate, run, poisons=True) -> dict[str, str]:
-        """Return the original request for a retried seq_id; else validate, then queue."""
+    def submit(
+        model_id, seq_id, description, validate, run, poisons=True, prepare=None
+    ) -> dict[str, str]:
+        """Return the original request for a retried seq_id; else validate, then queue. With
+        ``prepare(session, payload)``, ``run`` gets its result as a third argument."""
         model_or_404(model_id)
         request_id = scheduler.existing_request(model_id, seq_id)
         if request_id is None:
@@ -167,13 +170,23 @@ def create_app(
                 payload = validate()
             except UserError as e:
                 raise ApiError(400, str(e)) from None
-            request_id = scheduler.submit(
-                model_id,
-                seq_id,
-                description,
-                lambda session: run(session, payload),
-                poisons=poisons,
-            )
+            if prepare is None:
+                request_id = scheduler.submit(
+                    model_id,
+                    seq_id,
+                    description,
+                    lambda session: run(session, payload),
+                    poisons=poisons,
+                )
+            else:
+                request_id = scheduler.submit(
+                    model_id,
+                    seq_id,
+                    description,
+                    lambda session, prepared: run(session, payload, prepared),
+                    poisons=poisons,
+                    prepare=lambda session: prepare(session, payload),
+                )
         return {"request_id": request_id, "model_id": model_id}
 
     def checkpoint_path(name: str) -> Path:
@@ -232,7 +245,8 @@ def create_app(
             body.seq_id,
             "forward_backward",
             validate,
-            lambda session, steps: session.forward_backward(steps),
+            lambda session, steps, batches: session.forward_backward(steps, batches),
+            prepare=lambda session, steps: session.prepare(steps),
         )
 
     @app.post(f"{v1}/optim_step", dependencies=auth)

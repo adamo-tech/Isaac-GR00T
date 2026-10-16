@@ -100,6 +100,11 @@ class ServerConfig:
 
     device: str = "cuda"
 
+    chunk_size: int = 256
+    """Most datums per forward/backward pass; a larger forward_backward batch runs as several
+    passes with gradient accumulation (same gradient and loss). 256 fits an H100 with LoRA at
+    3 x 224 px cameras; 384 does not."""
+
     lora: bool = False
     """Train the action head through LoRA (rank from create_model's lora_config)."""
 
@@ -211,6 +216,7 @@ def build(cfg: ServerConfig):
             augment=cfg.augment,
             bf16=config.training.bf16,
             lora=lora,
+            chunk_size=cfg.chunk_size,
         )
 
     return spec, create_session

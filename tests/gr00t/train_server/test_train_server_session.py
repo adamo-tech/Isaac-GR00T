@@ -200,3 +200,51 @@ def test_layout_maps_from_offsets():
     assert state_map == action_map == [3, 4, 5, 6, 7, 0]
     with pytest.raises(SystemExit, match="gripper"):
         layout_maps(make_spec(), "arm=3")
+
+
+class _MaskedLossModel(torch.nn.Module):
+    """Deterministic stand-in returning GR00T's loss outputs (masked mean over action elements)."""
+
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.linspace(0.5, 1.5, 3))
+
+    def forward(self, batch):
+        mask = batch["action_mask"]
+        action_loss = (batch["x"] * self.w) ** 2 * mask
+        return {
+            "loss": action_loss.sum() / (mask.sum() + 1e-6),
+            "action_loss": action_loss,
+            "action_mask": mask,
+        }
+
+
+def test_chunked_forward_backward_matches_one_pass():
+    """Split batches accumulate the same gradient and report the same loss as one pass, also when
+    chunks hold different numbers of valid action elements."""
+    session = make_session()
+    session.model = _MaskedLossModel()
+    gen = torch.Generator().manual_seed(0)
+    x = torch.randn(5, 4, 3, generator=gen)
+    mask = torch.ones(5, 4, 3)
+    mask[3:, 2:] = 0  # the last chunk has fewer valid elements
+
+    def run(chunks):
+        session.model.w.grad = None
+        batches = [{"x": x[a:b], "action_mask": mask[a:b]} for a, b in chunks]
+        out = session.forward_backward(None, batches)
+        return out, session.model.w.grad.clone()
+
+    whole, grad_whole = run([(0, 5)])
+    split, grad_split = run([(0, 2), (2, 4), (4, 5)])
+    torch.testing.assert_close(grad_split, grad_whole)
+    assert split["metrics"]["loss:mean"] == pytest.approx(whole["metrics"]["loss:mean"], rel=1e-6)
+    per_datum = lambda o: [d["loss"]["data"][0] for d in o["loss_fn_outputs"]]  # noqa: E731
+    assert per_datum(split) == pytest.approx(per_datum(whole), rel=1e-6)
+
+
+def test_prepare_collates_in_chunks():
+    session = make_session()
+    session.chunk_size = 3
+    batches = session.prepare(make_steps(7))
+    assert [len(b["action_mask"]) for b in batches] == [3, 3, 1]

@@ -103,6 +103,10 @@ def download(hf_token: str = "") -> None:
     gpu="H100",
     volumes={ASSETS: assets, CHECKPOINTS: checkpoints},
     secrets=[modal.Secret.from_name("gr00t-train-api-key")],
+    # CPU cores for the batch preparation (processor + collator), which runs on its own
+    # thread ahead of the GPU work; one core left it ~2/3 of every step.
+    cpu=8.0,
+    memory=32768,
     max_containers=1,
     scaledown_window=IDLE_SECONDS,
     timeout=600,  # per request; the work itself runs on the server's worker thread
@@ -115,6 +119,9 @@ def serve():
     # transformers' Mistral-tokenizer probe, which also goes to the hub.
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["GROOT_PATCH_MISTRAL"] = "1"
+    import torch
+
+    torch.set_num_threads(8)  # the image defaults to OMP_NUM_THREADS=1
 
     from gr00t.train_server.app import create_app
     from gr00t.train_server.launch import ServerConfig, build

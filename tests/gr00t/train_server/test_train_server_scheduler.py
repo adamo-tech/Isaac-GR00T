@@ -15,8 +15,10 @@
 
 """Ordering, retry and failure semantics of the training server's scheduler."""
 
+import threading
 import time
 
+from gr00t.train_server import scheduler as scheduler_module
 from gr00t.train_server.datum import UserError
 from gr00t.train_server.scheduler import Scheduler
 import pytest
@@ -165,3 +167,94 @@ def test_model_retired_while_creating_never_gets_a_session(scheduler):
     (create_f,) = wait_done(scheduler, [created.request_id])
     assert create_f.done
     assert scheduler._models[created.model_id].session is None
+
+
+def test_prepare_runs_ahead_in_seq_order(scheduler):
+    """Prepares overlap the running call, never run out of order, and feed their own run."""
+    model_id = make_model(scheduler)
+    release = threading.Event()
+    events = []
+
+    def prepare(seq_id):
+        def fn(session):
+            assert session == "session"
+            events.append(("prepare", seq_id, threading.current_thread().name))
+            return f"batch{seq_id}"
+
+        return fn
+
+    def run(seq_id):
+        def fn(session, batch):
+            assert batch == f"batch{seq_id}"
+            events.append(("run", seq_id))
+            if seq_id == 1:
+                assert release.wait(5)
+            return {"seq_id": seq_id}
+
+        return fn
+
+    ids = [scheduler.submit(model_id, s, "fb", run(s), prepare=prepare(s)) for s in (1, 3, 4)]
+    time.sleep(0.2)
+    # seq 2 is missing: seq 1 runs (blocked); 3 and 4 must not be prepared past the gap
+    assert [e[:2] for e in events] == [("prepare", 1), ("run", 1)]
+    ids.append(scheduler.submit(model_id, 2, "optim", recorder([], 2)))
+    time.sleep(0.2)
+    # while seq 1 still runs, the next prepare steps (3, 4) run ahead on the prep thread
+    assert [e[:2] for e in events] == [("prepare", 1), ("run", 1), ("prepare", 3), ("prepare", 4)]
+    assert all(e[2].startswith("gr00t-train-prep") for e in events if e[0] == "prepare")
+    release.set()
+    futures = wait_done(scheduler, ids)
+    assert [f.result for f in futures] == [{"seq_id": s} for s in (1, 3, 4, 2)]
+    assert [e[:2] for e in events if e[0] == "run"] == [("run", 1), ("run", 3), ("run", 4)]
+
+
+def test_prefetch_depth_is_bounded(scheduler, monkeypatch):
+    model_id = make_model(scheduler)
+    prepared = []
+    release = threading.Event()
+
+    def blocking_run(session, batch):
+        assert release.wait(5)
+        return {}
+
+    def prep(seq_id):
+        return lambda session: prepared.append(seq_id)
+
+    ids = [scheduler.submit(model_id, 1, "fb", blocking_run, prepare=prep(1))]
+    ids += [
+        scheduler.submit(model_id, s, "fb", lambda session, b: {}, prepare=prep(s))
+        for s in range(2, 7)
+    ]
+    time.sleep(0.2)
+    assert prepared == [1, *range(2, 2 + scheduler_module.PREFETCH)]
+    release.set()
+    wait_done(scheduler, ids)
+    assert prepared == [1, 2, 3, 4, 5, 6]
+
+
+def test_prepare_error_fails_and_poisons(scheduler):
+    model_id = make_model(scheduler)
+
+    def bad_prepare(session):
+        raise UserError("bad batch")
+
+    first = scheduler.submit(model_id, 1, "fb", lambda s, b: {}, prepare=bad_prepare)
+    later = scheduler.submit(model_id, 2, "optim", recorder([], 2))
+    failed, skipped = wait_done(scheduler, [first, later])
+    assert (failed.error, failed.category) == ("bad batch", "user")
+    assert "earlier call" in skipped.error
+
+
+def test_prepare_waits_for_create_model(scheduler):
+    gate = threading.Event()
+    created = scheduler.create_model(lambda: gate.wait(5) and "session")
+    model_id = created.model_id
+    prepared = []
+    req = scheduler.submit(
+        model_id, 1, "fb", lambda s, b: {"b": b}, prepare=lambda s: prepared.append(s) or "x"
+    )
+    time.sleep(0.1)
+    assert prepared == []
+    gate.set()
+    (future,) = wait_done(scheduler, [req])
+    assert prepared == ["session"] and future.result == {"b": "x"}

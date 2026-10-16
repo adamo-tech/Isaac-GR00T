@@ -20,9 +20,14 @@ is read later through ``get``. Per model, a call runs only after every lower seq
 calls arriving out of order wait for the gap. A repeated seq_id returns the original
 request_id. Once a call fails, later calls for that model fail too (unless the failed call was
 marked ``poisons=False``, as saves are). A retired (replaced) model fails everything queued.
+
+A call may come with a ``prepare(session)`` step (CPU work such as building the batch) whose
+result is passed to ``run``. Prepare steps run on their own thread, one at a time in seq_id
+order, up to ``PREFETCH`` calls ahead of the worker, so they overlap the previous calls' GPU work.
 """
 
 from collections import deque
+from concurrent.futures import Future as _PrepFuture, ThreadPoolExecutor
 from dataclasses import dataclass, field
 import logging
 import threading
@@ -33,6 +38,10 @@ from .datum import UserError
 
 
 logger = logging.getLogger(__name__)
+
+PREFETCH = 2
+"""Calls with a prepare step that may be prepared ahead of the worker, per model (each prepared
+forward_backward batch holds its images as float32 pixel values, ~0.25 GB at batch 54)."""
 
 
 @dataclass
@@ -55,8 +64,10 @@ class _CreateRun:
 @dataclass
 class _Job:
     future: Future
-    run: Callable[[Any], dict[str, Any]] | _CreateRun
+    run: Callable[..., dict[str, Any]] | _CreateRun
     poisons: bool
+    prepare: Callable[[Any], Any] | None = None
+    prepared: _PrepFuture | None = None
 
 
 @dataclass
@@ -77,6 +88,8 @@ class Scheduler:
         self._models: dict[str, _Model] = {}
         self._creates: deque[_Job] = deque()
         self._stopped = False
+        # One thread: prepare steps share the session's processor (and its augmentation RNG).
+        self._prep = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gr00t-train-prep")
         self._thread = threading.Thread(target=self._work, name="gr00t-train-worker", daemon=True)
         self._thread.start()
 
@@ -85,6 +98,7 @@ class Scheduler:
             self._stopped = True
             self._cond.notify_all()
         self._thread.join()
+        self._prep.shutdown(wait=True, cancel_futures=True)
 
     def has_model(self, model_id: str) -> bool:
         with self._cond:
@@ -135,11 +149,13 @@ class Scheduler:
         model_id: str,
         seq_id: int,
         description: str,
-        run: Callable[[Any], dict[str, Any]],
+        run: Callable[..., dict[str, Any]],
         *,
         poisons: bool = True,
+        prepare: Callable[[Any], Any] | None = None,
     ) -> str:
-        """Queue ``run(session)`` as seq_id of model_id; returns its request_id."""
+        """Queue ``run(session)`` as seq_id of model_id; returns its request_id. With
+        ``prepare``, the call is ``run(session, prepare(session))``, prepare running ahead."""
         with self._cond:
             model = self._models[model_id]
             if seq_id in model.request_ids:
@@ -149,7 +165,8 @@ class Scheduler:
             if model.retired is not None:
                 self._set(future, error=model.retired, category="user")
                 return future.request_id
-            model.pending[seq_id] = _Job(future, run, poisons)
+            model.pending[seq_id] = _Job(future, run, poisons, prepare)
+            self._prefetch(model)
             self._cond.notify_all()
             return future.request_id
 
@@ -168,8 +185,28 @@ class Scheduler:
             job = model.pending.pop(model.next_seq_id, None)
             if job is not None:
                 model.next_seq_id += 1
+                if model.failure is None:
+                    self._start_prepare(model, job)  # queued before any later call's
+                    self._prefetch(model)
                 return model, job
         return None
+
+    def _start_prepare(self, model: _Model, job: _Job) -> None:
+        if job.prepare is not None and job.prepared is None:
+            job.prepared = self._prep.submit(job.prepare, model.session)
+
+    def _prefetch(self, model: _Model) -> None:
+        """Start the prepare steps of the next pending calls, in seq_id order, stopping at the
+        first seq_id that has not arrived so prepares never run out of order. Call with the
+        lock held."""
+        if model.session is None or model.retired is not None or model.failure is not None:
+            return
+        ahead, seq_id = 0, model.next_seq_id
+        while ahead < PREFETCH and (job := model.pending.get(seq_id)) is not None:
+            if job.prepare is not None:
+                self._start_prepare(model, job)
+                ahead += 1
+            seq_id += 1
 
     def _work(self) -> None:
         while True:
@@ -200,8 +237,14 @@ class Scheduler:
                 with self._cond:
                     if model.retired is None:
                         model.session = session
+                        self._prefetch(model)
                 del session
                 result = {"type": "create_model", "model_id": job.run.model_id}
+            elif job.prepare is not None:
+                prepared = job.prepared.result() if job.prepared else job.prepare(model.session)
+                job.prepared = None  # release the prepared batch with the call
+                result = job.run(model.session, prepared)
+                del prepared
             else:
                 result = job.run(model.session)
         except UserError as e:

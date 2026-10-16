@@ -61,8 +61,12 @@ class TrainingSession:
         augment: bool = True,
         bf16: bool = True,
         lora: LoraSettings | None = None,
+        chunk_size: int = 256,
     ):
         self.lora = lora
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+        self.chunk_size = chunk_size  # most datums per forward/backward pass
         if lora is not None:
             if lora.rank <= 0:
                 raise UserError("this server trains LoRA; create_model needs lora_config.rank > 0")
@@ -89,7 +93,10 @@ class TrainingSession:
             return torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)
         return contextlib.nullcontext()
 
-    def forward_backward(self, steps: list[VLAStepData]) -> dict[str, Any]:
+    def prepare(self, steps: list[VLAStepData]) -> list[dict[str, Any]]:
+        """The model inputs for ``steps``, collated in chunks of at most ``chunk_size`` datums
+        (processor + collator; CPU only, so the scheduler runs it ahead of the GPU work, on one
+        thread and in call order)."""
         try:
             processed = [
                 self.processor([{"type": MessageType.EPISODE_STEP.value, "content": step}])
@@ -97,23 +104,41 @@ class TrainingSession:
             ]
         except (KeyError, ValueError) as e:
             raise UserError(f"GR00T processor rejected the batch: {e}") from e
-        batch = self.collator(processed)["inputs"]
+        return [
+            self.collator(processed[i : i + self.chunk_size])["inputs"]
+            for i in range(0, len(processed), self.chunk_size)
+        ]
 
-        with self._autocast():
-            out = self.model(batch)
-        loss = out["loss"]
-        loss.backward()
+    def forward_backward(
+        self, steps: list[VLAStepData], batches: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
+        """Accumulate the gradient of the batch's masked-mean loss; ``batches`` is
+        ``prepare(steps)`` if already built.
 
-        action_loss = out["action_loss"].detach().float()
-        mask = out["action_mask"].detach().float()
-        per_datum = (action_loss.sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)).cpu().tolist()
+        A batch larger than ``chunk_size`` runs as several forward/backward passes, each chunk's
+        loss weighted by its share of the batch's valid action elements, so the accumulated
+        gradient and the reported loss equal those of one pass over the whole batch."""
+        if batches is None:
+            batches = self.prepare(steps)
+        total = sum(float(b["action_mask"].sum()) for b in batches)
+        loss_sum, per_datum = 0.0, []
+        for batch in batches:
+            with self._autocast():
+                out = self.model(batch)
+            action_loss = out["action_loss"].detach().float()
+            mask = out["action_mask"].detach().float()
+            weight = float(mask.sum()) / total if len(batches) > 1 else 1.0
+            (out["loss"] * weight).backward()
+            loss_sum += out["loss"].item() * weight
+            per_datum += (action_loss.sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) + 1e-6)).tolist()
+            del out, action_loss, mask
         return {
             "type": "forward_backward",
             "loss_fn_output_type": "ArrayRecord",
             "loss_fn_outputs": [
                 {"loss": {"data": [value], "dtype": "float32", "shape": [1]}} for value in per_datum
             ],
-            "metrics": {"loss:mean": loss.item()},
+            "metrics": {"loss:mean": loss_sum},
         }
 
     def optim_step(self, adam_params: dict[str, float]) -> dict[str, Any]:
