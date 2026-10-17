@@ -5,10 +5,10 @@ policy loads once at startup on its own thread (TRT backbone + compiled action h
 graph per prompt, ~20 ms per chunk on an RTX 4090). Then:
 
     POST /start   {"robot_name": "abc-sim", "adamo_api_key": "ak_...", "prompt": ..., "lora": ...}
-                  connect, (optionally) swap in another LoRA, compile the prompt if it is new,
-                  claim the robot and drive it;
+                  connect, load the LoRA (or, without "lora", the base weights), compile the prompt
+                  if it is new, claim the robot and drive it;
     POST /lora    {"lora": "abc-sim-r64-b256-500"}  write another LoRA into the live weights (~0.1 s,
-                  no recompile), also during a run;
+                  no recompile), also during a run; {"lora": null} restores the base weights;
     POST /take_control   reclaim the robot after another operator took it;
     POST /stop    release the robot and disconnect;
     GET  /status  policy phase, LoRA, cameras, state, inference and control;
@@ -67,7 +67,9 @@ class Args:
     lora_root: str = "."
     """Relative LoRA names (/start, /lora) resolve here."""
     lora: str | None = None
-    """LoRA loaded at startup (name under lora_root or a path); None serves the base weights."""
+    """LoRA loaded at startup (name under lora_root or a path). Runs swap other LoRAs, or the base
+    weights, into its adapted layers, so they must share its target layers and projector slot
+    settings. None serves only the base weights, with no LoRA swaps."""
     prompt: str = "sim put the plastic bottles in the bin"
     """Default prompt, compiled at startup."""
     embodiment_tag: str = "new_embodiment"
@@ -82,7 +84,7 @@ class StartRequest(BaseModel):
     prompt: str | None = None
     """Overrides the server's default prompt; a new prompt compiles first (~1 min)."""
     lora: str | None = None
-    """Swap this LoRA in before the run (name under the LoRA root or a path)."""
+    """LoRA for the run (name under the LoRA root or a path); None runs the base weights."""
     state_topic: str = "{robot}/action/joints"
     control_topic: str = "{robot}/control/joint_state"
     control_hz: float = 30.0
@@ -97,7 +99,8 @@ class StartRequest(BaseModel):
 
 
 class LoraRequest(BaseModel):
-    lora: str
+    lora: str | None
+    """None restores the base weights."""
 
 
 class FastPolicy:
@@ -141,10 +144,16 @@ class FastPolicy:
         logger.warning("prompt %r ready, latency ms %s", prompt, [round(t, 1) for t in times])
         return times
 
-    def swap(self, lora_dir: Path) -> None:
+    def swap(self, lora_dir: Path | None) -> None:
+        """Write the LoRA in ``lora_dir`` (None: the base weights) into the live weights."""
         if self.swapper is None:
+            if lora_dir is None:
+                return  # only the base weights are loaded
             raise ValueError("serving the base weights; start the server with a LoRA to swap LoRAs")
-        self.swapper.swap(lora_dir)
+        if lora_dir is None:
+            self.swapper.use_base()
+        else:
+            self.swapper.swap(lora_dir)
         self.fast.refresh_weights()
 
 
@@ -539,14 +548,19 @@ class PolicyWorker:
         self._tasks.put((fn, fut))
         return fut.result(timeout)
 
-    def swap(self, lora: str) -> str:
-        lora_dir = self.resolve_lora(lora)
+    def swap(self, lora: str | None) -> str | None:
+        """Load ``lora`` (None: the base weights); returns its directory, or None for base."""
+        lora_dir = None if lora is None else self.resolve_lora(lora)
 
         def do_swap():
             t0 = time.perf_counter()
             self.policy.swap(lora_dir)
-            self.lora = str(lora_dir)
-            logger.warning("swapped in %s in %.0f ms", lora_dir, (time.perf_counter() - t0) * 1e3)
+            self.lora = None if lora_dir is None else str(lora_dir)
+            logger.warning(
+                "loaded %s in %.0f ms",
+                self.lora or "the base weights",
+                (time.perf_counter() - t0) * 1e3,
+            )
             return self.lora
 
         return self.submit(do_swap)
@@ -556,8 +570,7 @@ class PolicyWorker:
         with self._lock:
             self.stop()
             self.last_stop = None
-            if req.lora is not None:
-                self.swap(req.lora)
+            self.swap(req.lora)
             if prompt not in self.policy.prompts:
                 previous, self.phase = self.phase, "compiling"
                 try:

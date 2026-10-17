@@ -4,13 +4,13 @@ Serves runpod/abc_sim/adamo_server.py (routes /start, /stop, /status, /take_cont
 at a public *.modal.run URL, like abc's deploy/modal_app.py serves its adamo_server. The model is
 the base nvidia/GR00T-N1.7-3B from the gr00t-assets Volume, the abc-sim processor built from
 runpod/abc_sim/abc_sim_config.py + modal/abc_sim_statistics.json (as the training server builds
-it), and a LoRA from the gr00t-train-lora-checkpoints Volume, merged into the action head, so it
-costs nothing at inference. /start or /lora with another LoRA name writes it into the live
-weights in ~0.1 s without recompiling; the Volume is reloaded first, so LoRAs saved after the
-container started are found.
+it), and, per run, a LoRA from the gr00t-train-lora-checkpoints Volume merged into the action
+head, so it costs nothing at inference. /start or /lora with a LoRA name writes it into the live
+weights in ~0.1 s without recompiling (the Volume is reloaded first, so LoRAs saved after the
+container started are found); /start without "lora" runs the base weights, restored the same way.
 
-    modal deploy modal/gr00t_fast_adamo.py                      # LoRA abc-sim-r64-b256-500
-    GR00T_LORA=abc-sim-r64-b256-300 modal deploy modal/gr00t_fast_adamo.py   # another startup LoRA
+    modal deploy modal/gr00t_fast_adamo.py
+    GR00T_LORA=abc-sim-r64-b256-300 modal deploy modal/gr00t_fast_adamo.py   # another template LoRA
     uv run --no-project --with modal python modal/run_fast_adamo.py abc-sim --lora abc-sim-r64-b256-500
     modal app stop gr00t-fast-adamo                             # take the endpoint down
 
@@ -24,8 +24,9 @@ is active, _keepalive requests its own public /status, because Modal sees a robo
 traffic, no HTTP) as idle.
 
 Environment, read at deploy time: GR00T_GPU (default L40S), GR00T_REGION (default us; empty for
-any), GR00T_LORA (startup LoRA, a directory name on gr00t-train-lora-checkpoints; empty for the
-base weights).
+any), GR00T_LORA (the LoRA loaded at startup, default abc-sim-r64-b256-500, a directory name on
+gr00t-train-lora-checkpoints; runs can swap in any LoRA with its target layers and projector slot
+settings, or the base weights; empty loads only the base weights, with no LoRA swaps).
 """
 
 import os

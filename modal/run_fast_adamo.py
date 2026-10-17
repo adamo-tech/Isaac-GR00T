@@ -48,7 +48,9 @@ def main(argv=None) -> int:
     p.add_argument("robot", nargs="?", default="abc-sim")
     p.add_argument("--prompt", default=None, help="default: the server's (abc-sim bottles task)")
     p.add_argument(
-        "--lora", default=None, help="LoRA on gr00t-train-lora-checkpoints; default: loaded one"
+        "--lora",
+        default=None,
+        help="LoRA on gr00t-train-lora-checkpoints; default: the base weights, no LoRA",
     )
     p.add_argument("--execute-steps", type=int, default=20)
     p.add_argument("--inference-lead-steps", type=int, default=8)
