@@ -106,6 +106,10 @@ image = (
             # transformers' Mistral-tokenizer probe, which also goes to the hub.
             "HF_HUB_OFFLINE": "1",
             "GROOT_PATCH_MISTRAL": "1",
+            # Compile and load Inductor kernels in-process. With the default worker pool, a
+            # container that hits the compile cache on the Volume waits forever on the workers'
+            # futures (idle, 0% CPU) while loading the cached graph.
+            "TORCHINDUCTOR_COMPILE_THREADS": "1",
             "GR00T_GPU": GPU,
             "GR00T_LORA": LORA or "",
         }
