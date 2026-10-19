@@ -72,19 +72,14 @@ dev = [
     "pre-commit",
     # `tomllib` is 3.11+ stdlib; provide `tomli` for the 3.10 fallback.
     "tomli; python_version < '3.11'",
-    # FastAPI's TestClient (tests/gr00t/train_server).
-    "httpx",
 ]
-train-server = [
-    "fastapi==0.143.2",
-    "uvicorn==0.54.0",
-    # HTTP client for scripts/train_server_smoke.py.
-    "httpx==0.28.1",
-]
+
+[project.entry-points."adamo.models"]
+"nvidia/GR00T-N1.7" = "adamo_model"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["gr00t*"]
+include = ["gr00t*", "adamo_model*"]
 
 [tool.uv]
 required-environments = [

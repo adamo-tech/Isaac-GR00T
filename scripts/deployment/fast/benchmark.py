@@ -16,22 +16,24 @@
 """Check FastGr00t (optionally with a merged LoRA) against eager PyTorch and time it.
 
     python -m scripts.deployment.fast.benchmark --model-path <ckpt> --embodiment-tag new_embodiment \
-        --lora-dir <train-server LoRA dir> --height 224 --width 224 --engine-dir trt_fast/engines
+        --lora-dir <adamo_model save_weights dir> --height 224 --width 224 --engine-dir trt_fast/engines
 
 The reference is the eager model with the same noise; with a LoRA it keeps the peft adapters
 unmerged, i.e. the trained model exactly as the training server ran it.
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 import time
 
+from adamo_model.lora import attach_lora, merge_lora, read_lora
+from gr00t.policy.gr00t_policy import Gr00tPolicy
 import numpy as np
 import torch
 import tyro
 
 from .build_engines import dummy_observation
 from .fast_gr00t import FastGr00t
-from .lora import attach_lora, load_lora_policy, merge_lora, read_lora
 
 
 @dataclass
@@ -43,8 +45,6 @@ class Config:
     width: int = 224
     engine_dir: str = "trt_fast/engines"
     iters: int = 200
-    swap_lora_dir: str | None = None
-    """Also time LoraSwapper.swap to this LoRA (written into the running graph's weights)."""
 
 
 def bench(fn, iters, warmup=10):
@@ -61,7 +61,7 @@ def bench(fn, iters, warmup=10):
 
 
 def main(cfg: Config) -> None:
-    policy, swapper = load_lora_policy(cfg.model_path, None, cfg.embodiment_tag, strict=False)
+    policy = Gr00tPolicy(cfg.embodiment_tag, cfg.model_path, device="cuda:0", strict=False)
     obs = dummy_observation(policy, cfg.height, cfg.width)
     instruction = obs["language"][policy.language_key][0][0]
     ah = policy.model.action_head
@@ -72,7 +72,7 @@ def main(cfg: Config) -> None:
 
     # eager reference: unmerged adapters, fixed noise
     if cfg.lora_dir:
-        attach_lora(policy.model, *read_lora(cfg.lora_dir))
+        attach_lora(policy.model, *read_lora(Path(cfg.lora_dir)))
     captured = {}
     get_action, randn = policy.model.get_action, torch.randn
 
@@ -92,9 +92,7 @@ def main(cfg: Config) -> None:
     finally:
         policy.model.get_action, torch.randn = get_action, randn
     if cfg.lora_dir:
-        from .lora import LoraSwapper
-
-        swapper = LoraSwapper(policy.model, read_lora(cfg.lora_dir)[0], merge_lora(policy.model))
+        merge_lora(policy.model)
 
     fast = FastGr00t(policy, cfg.engine_dir, H=cfg.height, W=cfg.width)
     t0 = time.time()
@@ -113,16 +111,6 @@ def main(cfg: Config) -> None:
     c = fast.graphs[instruction]
     print("graph replay:     ", bench(lambda: fast.replay(c), cfg.iters))
     print("get_action (numpy):", bench(lambda: fast.get_action(obs), cfg.iters))
-
-    if cfg.swap_lora_dir and swapper is not None:
-
-        def swap_and_refresh():
-            swapper.swap(cfg.swap_lora_dir)
-            fast.refresh_weights()
-
-        print("LoRA swap + refresh:", bench(swap_and_refresh, 10, warmup=1))
-        if cfg.swap_lora_dir == cfg.lora_dir:
-            compare("after swapping the same LoRA back in")
 
 
 if __name__ == "__main__":
