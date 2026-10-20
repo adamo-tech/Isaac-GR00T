@@ -16,6 +16,7 @@ from gr00t.data.types import (
 from gr00t.experiment.launch_finetune import build_config
 from gr00t.model.gr00t_n1d7.setup import Gr00tN1d7Pipeline
 import numpy
+from PIL import Image
 from runtime import model_storage
 
 from adamo_model.lora import LoraSettings
@@ -26,6 +27,7 @@ BASE_CHECKPOINT_CHECKSUM = "339454305dedcf2729dde2e39cca0856f2d4abcb52776dedc394
 EMBODIMENT_TAG = EmbodimentTag.NEW_EMBODIMENT
 LANGUAGE_KEY = "annotation.human.task_description"
 ACTION_HORIZON = 40
+IMAGE_SIZE = 224
 
 
 def ranges(parts):
@@ -196,13 +198,25 @@ def lora_settings(rank, processor, base_checkpoint, parts):
     )
 
 
+def letterbox(image):
+    height, width = image.shape[:2]
+    ratio = max(width / IMAGE_SIZE, height / IMAGE_SIZE)
+    resized_height, resized_width = int(height / ratio), int(width / ratio)
+    resized = numpy.asarray(
+        Image.fromarray(numpy.ascontiguousarray(image)).resize(
+            (resized_width, resized_height), resample=Image.BILINEAR
+        )
+    )
+    placed = numpy.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=numpy.uint8)
+    top, left = (IMAGE_SIZE - resized_height) // 2, (IMAGE_SIZE - resized_width) // 2
+    placed[top : top + resized_height, left : left + resized_width] = resized
+    return placed
+
+
 def gr00t_observation(observation, prompt, image_keys, parts):
     state = numpy.asarray(observation["state"], dtype=numpy.float32)
     return {
-        "video": {
-            key: numpy.ascontiguousarray(observation["images"][key])[None, None]
-            for key in image_keys
-        },
+        "video": {key: letterbox(observation["images"][key])[None, None] for key in image_keys},
         "state": {
             name: state[start:end][None, None] for name, (start, end) in ranges(parts).items()
         },

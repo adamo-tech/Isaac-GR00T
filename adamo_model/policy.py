@@ -69,34 +69,27 @@ def load_lora_policy(
 
 
 class Gr00tN17Policy:
-    def __init__(self, gr00t_policy, model_directory, mapping):
-        self.gr00t_policy = gr00t_policy
-        self.model_directory = model_directory
-        self.fast = None
+    def __init__(self, fast, mapping):
+        self.fast = fast
         self.mapping = {name: mapping[name] for name in ("images", "state", "action", "frame_rate")}
         self.action_sizes = mapping["action_sizes"]
         self.parts = mapping["embodiment"]
         self.refill_step_index = mapping["action_horizon"] // 2
 
     def infer(self, observation, prompt, prefix=None, inference_delay=0, real_time_chunking=False):
-        gr00t_observation = embodiment.gr00t_observation(
-            observation, prompt, self.mapping["images"], self.parts
+        actions = self.fast.get_action(
+            embodiment.gr00t_observation(observation, prompt, self.mapping["images"], self.parts)
         )
-
-        if self.fast is None:
-            height, width = gr00t_observation["video"][self.mapping["images"][0]].shape[2:4]
-            self.fast = FastGr00t(
-                self.gr00t_policy,
-                str(engine_directory(self.model_directory, height, width)),
-                H=height,
-                W=width,
-            )
-
-        return embodiment.robot_actions(self.fast.get_action(gr00t_observation), self.parts)
+        return embodiment.robot_actions(actions, self.parts)
 
 
-def engine_directory(model_directory, height, width):
-    directory = ENGINES / torch.cuda.get_device_name() / tensorrt.__version__ / f"{height}x{width}"
+def engine_directory(model_directory):
+    directory = (
+        ENGINES
+        / torch.cuda.get_device_name()
+        / tensorrt.__version__
+        / f"{embodiment.IMAGE_SIZE}x{embodiment.IMAGE_SIZE}"
+    )
 
     if not directory.exists():
         partial = directory.with_name(f"{directory.name}.partial")
@@ -104,8 +97,8 @@ def engine_directory(model_directory, height, width):
             Config(
                 model_path=str(model_directory),
                 embodiment_tag=embodiment.EMBODIMENT_TAG.value,
-                height=height,
-                width=width,
+                height=embodiment.IMAGE_SIZE,
+                width=embodiment.IMAGE_SIZE,
                 engine_dir=str(partial),
                 onnx_dir=tempfile.mkdtemp(),
             )
@@ -122,4 +115,10 @@ def load(policy):
         embodiment.base_checkpoint(), weights, Path(tempfile.mkdtemp())
     )
     gr00t_policy = load_lora_policy(model_directory, weights, embodiment.EMBODIMENT_TAG.value)
-    return Gr00tN17Policy(gr00t_policy, model_directory, mapping)
+    fast = FastGr00t(
+        gr00t_policy,
+        str(engine_directory(model_directory)),
+        H=embodiment.IMAGE_SIZE,
+        W=embodiment.IMAGE_SIZE,
+    )
+    return Gr00tN17Policy(fast, mapping)

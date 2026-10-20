@@ -35,7 +35,7 @@ def step_data(datum, frames, part_ranges):
         if isinstance(image, bytes):
             image = numpy.asarray(Image.open(io.BytesIO(image)).convert("RGB"))
 
-        images[key] = [image]
+        images[key] = [embodiment.letterbox(image)]
 
     state = numpy.concatenate(
         [
