@@ -4,7 +4,6 @@ import itertools
 import json
 import math
 import random
-import threading
 
 from gr00t.data.types import MessageType, VLAStepData
 import numpy
@@ -17,12 +16,13 @@ from adamo_model import embodiment
 from adamo_model.lora import ADAPTER_CONFIG_FILE, ADAPTER_FILE, apply_lora
 
 
-MICRO_BATCH_SIZE = 32
 PREPARE_THREAD_COUNT = 8
+CHUNK_SIZE = 256
 OPTIMIZER_FILE = "optimizer.pt"
+MAPPING_KEYS = ("images", "state", "action", "frame_rate", "state_sizes", "action_sizes")
 
 
-def step_data(datum, frames, state_parts, action_parts):
+def step_data(datum, frames, part_ranges):
     frame_images = {}
     images = {}
 
@@ -35,7 +35,7 @@ def step_data(datum, frames, state_parts, action_parts):
         if isinstance(image, bytes):
             image = numpy.asarray(Image.open(io.BytesIO(image)).convert("RGB"))
 
-        images[key] = [embodiment.letterbox(image)]
+        images[key] = [image]
 
     state = numpy.concatenate(
         [
@@ -47,11 +47,10 @@ def step_data(datum, frames, state_parts, action_parts):
         [numpy.asarray(value, dtype=numpy.float32) for value in datum["loss_fn_inputs"].values()],
         axis=1,
     )
-    states = {name: state[start:end][None] for name, (start, end) in state_parts.items()}
     return VLAStepData(
         images=images,
-        states=states,
-        actions={name: actions[:, start:end] for name, (start, end) in action_parts.items()},
+        states={name: state[start:end][None] for name, (start, end) in part_ranges.items()},
+        actions={name: actions[:, start:end] for name, (start, end) in part_ranges.items()},
         text=datum["prompt"],
         embodiment=embodiment.EMBODIMENT_TAG,
     )
@@ -59,37 +58,40 @@ def step_data(datum, frames, state_parts, action_parts):
 
 class Trainer:
     base_model = "nvidia/GR00T-N1.7"
-    action_horizon = 40
+    action_horizon = embodiment.ACTION_HORIZON
 
-    def __init__(self, rank, frames, state_directory=None, seed=None):
+    def __init__(self, rank, frames, state_directory=None, seed=None, parts=None):
         self.rank = rank
-        self.seed = random.randrange(2**31) if seed is None else seed
         self.frames = frames
+        self.parts = parts
+        self.seed = random.randrange(2**31) if seed is None else seed
         self.mapping = None
-        self.norm_stats = None
+        self.episodes = []
         self.processor = None
         self.step_count = 0
-        self.example_count = 0
-        self.processor_lock = threading.Lock()
         self.preparers = concurrent.futures.ThreadPoolExecutor(max_workers=PREPARE_THREAD_COUNT)
 
         if state_directory:
             saved = json.loads((state_directory / "mapping.json").read_text())
-            self.mapping = {
-                name: saved[name] for name in ("images", "state", "action", "frame_rate")
-            }
-            self.norm_stats = json.loads((state_directory / "norm_stats.json").read_text())
-            self.step_count = saved["step_count"]
+            self.mapping = {name: saved[name] for name in MAPPING_KEYS}
             self.seed = saved["seed"]
+            self.step_count = saved["step_count"]
+            self.parts = saved["embodiment"]
 
+        self.part_ranges = embodiment.ranges(self.parts)
         set_seed(self.seed)
-        self.pipeline = embodiment.pipeline(embodiment.base_checkpoint())
-        torch.backends.cuda.matmul.allow_tf32 = self.pipeline.config.training.tf32
-        torch.backends.cudnn.allow_tf32 = self.pipeline.config.training.tf32
+        self.base_checkpoint = embodiment.base_checkpoint()
+        self.pipeline = embodiment.pipeline(self.base_checkpoint)
+
+        if self.pipeline.config.training.tf32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
         self.model = self.pipeline._create_model()
 
         if state_directory:
-            self.built_processor()
+            statistics = json.loads((state_directory / "statistics.json").read_text())
+            self.start(statistics[embodiment.EMBODIMENT_TAG.value])
             trainable = load_file(state_directory / ADAPTER_FILE, device="cuda")
 
             with torch.no_grad():
@@ -102,12 +104,38 @@ class Trainer:
             )
 
     def set_norm_stats(self, norm_stats):
-        if self.norm_stats not in (None, norm_stats):
+        pass
+
+    def add_episodes(self, episodes):
+        self.episodes += episodes
+
+    def start(self, statistics):
+        self.processor = embodiment.processor(
+            self.pipeline, self.mapping["images"], self.parts, statistics
+        )
+        self.processor.train()
+        self.lora = embodiment.lora_settings(
+            self.rank, self.processor, self.base_checkpoint, self.parts
+        )
+        apply_lora(self.model, self.lora)
+        self.model.to("cuda").train()
+        self.params = [
+            parameter for parameter in self.model.parameters() if parameter.requires_grad
+        ]
+        self.optimizer = torch.optim.AdamW(self.params, lr=0.0)
+
+    def statistics_episodes(self, data):
+        if self.episodes:
+            return self.episodes
+
+        image = next(iter(data[0]["images"].values()))
+
+        if not isinstance(image, dict):
             raise ValueError(
-                "This run already has normalization stats, and these are different. A run keeps one set of stats."
+                "This run has no normalization stats. Call `training.compute_norm_stats(episodes)` before `forward_backward`."
             )
 
-        self.norm_stats = norm_stats
+        return self.frames.episodes(image["dataset"])
 
     def check_mapping(self, datum):
         mapping = {
@@ -115,12 +143,21 @@ class Trainer:
             "state": list(datum["state"]),
             "action": list(datum["loss_fn_inputs"]),
             "frame_rate": datum["frame_rate"],
+            "state_sizes": [numpy.size(value) for value in datum["state"].values()],
+            "action_sizes": [len(value[0]) for value in datum["loss_fn_inputs"].values()],
         }
         self.mapping = self.mapping or mapping
 
         if mapping != self.mapping:
             raise ValueError(
                 f"This run reads {self.mapping}, and a datum has {mapping}. A run keeps one set of image, state and action keys and one frame rate."
+            )
+
+        part_size = sum(part["size"] for part in self.parts)
+
+        if sum(mapping["state_sizes"]) != part_size or sum(mapping["action_sizes"]) != part_size:
+            raise ValueError(
+                f"The embodiment has {part_size} values ({', '.join(f'{part["name"]}: {part["size"]}' for part in self.parts)}), and a datum has {sum(mapping['state_sizes'])} state and {sum(mapping['action_sizes'])} action values. State and action follow the embodiment's parts, in order."
             )
 
         horizon = len(next(iter(datum["loss_fn_inputs"].values())))
@@ -130,80 +167,41 @@ class Trainer:
                 f"Action chunks have {horizon} steps, and this base model takes {self.action_horizon}."
             )
 
-    def built_processor(self):
-        missing = [
-            key
-            for key in self.mapping["state"] + self.mapping["action"]
-            if key not in (self.norm_stats or {})
-        ]
-
-        if missing:
-            raise ValueError(
-                f"There are no normalization stats for {', '.join(f'`{key}`' for key in missing)}. Pass `norm_stats` to `adamo.LoraTraining`, or use `dataset.batches`."
-            )
-
-        with self.processor_lock:
-            if self.processor is None:
-                self.state_parts, self.action_parts = (
-                    embodiment.parts(self.norm_stats, self.mapping, "state"),
-                    embodiment.parts(self.norm_stats, self.mapping, "action"),
-                )
-                self.lora_settings = embodiment.lora_settings(
-                    self.norm_stats, self.mapping, self.rank
-                )
-                apply_lora(self.model, self.lora_settings)
-                self.model.to("cuda").train()
-                self.params = [
-                    parameter for parameter in self.model.parameters() if parameter.requires_grad
-                ]
-                self.optimizer = torch.optim.AdamW(self.params, lr=0.0)
-                processor = embodiment.processor(
-                    self.pipeline, self.norm_stats, self.mapping, self.action_horizon
-                )
-                processor.train()
-                self.processor = processor
-
-        return self.processor
-
     def prepare(self, data):
         for datum in data:
             self.check_mapping(datum)
 
-        processor = self.built_processor()
+        if self.processor is None:
+            self.start(
+                embodiment.statistics(self.statistics_episodes(data), self.mapping, self.parts)
+            )
+
         examples = [
-            processor([{"type": MessageType.EPISODE_STEP.value, "content": step}])
+            self.processor([{"type": MessageType.EPISODE_STEP.value, "content": step}])
             for step in self.preparers.map(
-                step_data,
-                data,
-                itertools.repeat(self.frames),
-                itertools.repeat(self.state_parts),
-                itertools.repeat(self.action_parts),
+                step_data, data, itertools.repeat(self.frames), itertools.repeat(self.part_ranges)
             )
         ]
         return [
-            (
-                processor.collator(examples[start : start + MICRO_BATCH_SIZE])["inputs"],
-                len(examples[start : start + MICRO_BATCH_SIZE]),
-            )
-            for start in range(0, len(examples), MICRO_BATCH_SIZE)
+            self.processor.collator(examples[index : index + CHUNK_SIZE])["inputs"]
+            for index in range(0, len(examples), CHUNK_SIZE)
         ]
 
-    def forward_backward(self, prepared, example_count):
-        self.step_count += 1
-        loss_sum = 0.0
+    def forward_backward(self, batches, example_count):
+        total = sum(float(batch["action_mask"].sum()) for batch in batches)
+        loss = 0.0
 
-        for inputs, micro_batch_size in prepared:
+        for batch in batches:
             with torch.autocast(
                 "cuda", dtype=torch.bfloat16, enabled=self.pipeline.config.training.bf16
             ):
-                micro_batch_loss = self.model(inputs)["loss"] * micro_batch_size
+                output = self.model(batch)
 
-            micro_batch_loss.backward()
-            loss_sum += micro_batch_loss.item()
+            weight = float(output["action_mask"].detach().float().sum()) / total
+            (output["loss"] * weight).backward()
+            loss += output["loss"].item() * weight
 
-        self.example_count += example_count
-
-        return {"loss": loss_sum / example_count, "metrics": {"example_count": self.example_count}}
+        return {"loss": loss, "metrics": {}}
 
     def optim_step(self, adam_params):
         for group in self.optimizer.param_groups:
@@ -214,44 +212,35 @@ class Trainer:
                 weight_decay=adam_params["weight_decay"],
             )
 
-        for parameter in self.params:
-            if parameter.grad is not None:
-                parameter.grad /= self.example_count
-
-        torch.nn.utils.clip_grad_norm_(
-            self.params,
-            adam_params["grad_clip_norm"] if adam_params["grad_clip_norm"] > 0 else math.inf,
-        )
+        clip = adam_params["grad_clip_norm"]
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.params, clip if clip > 0 else math.inf)
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
-        self.example_count = 0
-
-    def saved_mapping(self):
-        action_sizes = [len(self.norm_stats[key]["q01"]) for key in self.mapping["action"]]
-        return {
-            **self.mapping,
-            "base_model": self.base_model,
-            "rank": self.rank,
-            "action_horizon": self.action_horizon,
-            "action_sizes": action_sizes,
-            "step_count": self.step_count,
-            "seed": self.seed,
-        }
+        self.step_count += 1
+        return {"grad_norm": float(grad_norm), "step": self.step_count}
 
     def save_weights(self, directory):
         save_file(
             {
-                name: parameter.detach().cpu().contiguous()
+                name: parameter.detach().contiguous()
                 for name, parameter in self.model.named_parameters()
                 if parameter.requires_grad
             },
             directory / ADAPTER_FILE,
         )
-        (directory / ADAPTER_CONFIG_FILE).write_text(json.dumps(self.lora_settings.to_json()))
+        (directory / ADAPTER_CONFIG_FILE).write_text(json.dumps(self.lora.to_json()))
         self.processor.save_pretrained(directory)
-        (directory / "norm_stats.json").write_text(json.dumps(self.norm_stats))
-        (directory / "mapping.json").write_text(json.dumps(self.saved_mapping()))
-        return self.saved_mapping()
+        mapping = {
+            **self.mapping,
+            "base_model": self.base_model,
+            "rank": self.rank,
+            "action_horizon": self.action_horizon,
+            "embodiment": self.parts,
+            "step_count": self.step_count,
+            "seed": self.seed,
+        }
+        (directory / "mapping.json").write_text(json.dumps(mapping))
+        return mapping
 
     def save_state(self, directory):
         torch.save(self.optimizer.state_dict(), directory / OPTIMIZER_FILE)
