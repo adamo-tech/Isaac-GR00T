@@ -103,9 +103,6 @@ class Trainer:
                 torch.load(state_directory / OPTIMIZER_FILE, map_location="cuda", weights_only=True)
             )
 
-    def set_norm_stats(self, norm_stats):
-        pass
-
     def add_episodes(self, episodes):
         self.episodes += episodes
 
