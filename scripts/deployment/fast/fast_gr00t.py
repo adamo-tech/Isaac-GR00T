@@ -27,8 +27,7 @@ Exact rewrites of the action head (same math as AlternateVLDiT):
 
 The ViT and LLM engines depend only on the (frozen) backbone, so every action-head fine-tune or
 LoRA of the same base model shares them. The action head runs in PyTorch (torch.compile) inside the
-graph, reading the live module weights: writing new weights in place and calling
-``refresh_weights()`` switches checkpoints without recompiling or recapturing (see lora.py).
+graph.
 """
 
 import numpy as np
@@ -180,11 +179,11 @@ class FastActionHead(torch.nn.Module):
         self.cross_src = {
             i: ("text" if i % every == 0 else "image") for i in range(0, len(self.blocks), 2)
         }
-        self.refresh(init=True)
+        self.precompute()
 
     @torch.no_grad()
-    def refresh(self, init=False):
-        """(Re)compute the weight-dependent constants; in place after init, so captured graphs see them."""
+    def precompute(self):
+        """Compute the weight-dependent constants."""
         ah, dit = self.ah, self.ah.model
         dev, dt = dit.proj_out_2.weight.device, dit.proj_out_2.weight.dtype
         bufs = {}
@@ -205,10 +204,7 @@ class FastActionHead(torch.nn.Module):
             ah.position_embedding(torch.arange(self.horizon, device=dev)).unsqueeze(0).to(dt)
         )
         for name, value in bufs.items():
-            if init:
-                self.register_buffer(name, value)
-            else:
-                getattr(self, name).copy_(value)
+            self.register_buffer(name, value)
 
     def _heads(self, x):
         B, S, D = x.shape
@@ -445,18 +441,18 @@ class FastGr00t:
         torch.cuda.current_stream().wait_stream(side)
         if self.llm_static:
             g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g), torch.inference_mode():
+            with torch.cuda.graph(g, capture_error_mode="thread_local"), torch.inference_mode():
                 self._forward(c, fah)
             c["graph"] = g
             return c
         # The stock LLM engine is not stream-capturable (data-dependent shapes in the deepstack
         # injection), so it is enqueued between two graphs; nothing waits on the host in between.
         ga, gb = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
-        with torch.cuda.graph(ga), torch.inference_mode():
+        with torch.cuda.graph(ga, capture_error_mode="thread_local"), torch.inference_mode():
             self._part_a(c)
         with torch.inference_mode():
             self.llm()
-        with torch.cuda.graph(gb), torch.inference_mode():
+        with torch.cuda.graph(gb, capture_error_mode="thread_local"), torch.inference_mode():
             self._part_b(c, fah)
         c["graph_a"], c["graph_b"] = ga, gb
         return c
@@ -471,12 +467,6 @@ class FastGr00t:
         c["graph_b"].replay()
 
     # ---------- public API ----------
-    def refresh_weights(self):
-        """Call after writing new action-head weights in place (e.g. LoraSwapper.swap): recomputes
-        the precomputed AdaLN/output modulations and position embeddings of every captured graph."""
-        for c in self.graphs.values():
-            c["fah"].refresh()
-
     def set_frames(self, frames_by_cam):
         """frames_by_cam: {cam_key: (T, H, W, 3) uint8}. Written into the pinned staging buffer."""
         i = 0

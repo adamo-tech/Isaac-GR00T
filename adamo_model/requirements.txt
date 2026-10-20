@@ -1,0 +1,42 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.9.0+cu128
+torchvision==0.24.0+cu128
+transformers==4.57.3
+flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+numpy==2.2.6
+pyarrow==23.0.1
+albumentations==1.4.18
+huggingface-hub
+opencv-python-headless>=4.5,<4.13
+diffusers==0.35.1
+dm-tree
+msgpack==1.1.0
+msgpack-numpy==0.4.8
+pandas==2.2.3
+peft==0.17.1
+termcolor==3.2.0
+tyro==0.9.17
+click==8.1.8
+datasets==4.8.5
+einops==0.8.1
+gitpython==3.1.50
+jsonlines==4.0.0
+matplotlib==3.10.1
+omegaconf==2.3.0
+scipy==1.15.3
+torchcodec==0.8.0
+wandb==0.24.2
+--extra-index-url https://pypi.nvidia.com
+fastapi
+uvicorn
+aiohttp
+fsspec[gcs,http,s3]>=2024.6.0
+google-crc32c
+lerobot==0.4.4
+adamo==1.0.10
+tensorrt-cu12==10.15.1.29
+tensorrt-cu12-bindings==10.15.1.29
+tensorrt-cu12-libs==10.15.1.29
+onnx==1.20.1
+onnxscript==0.7.0
+onnx-ir==0.2.1
