@@ -1,7 +1,7 @@
 import json
-import os
 from pathlib import Path
 import tempfile
+import uuid
 
 from gr00t.policy.gr00t_policy import Gr00tPolicy
 from peft.tuners.lora import LoraLayer
@@ -12,16 +12,34 @@ from scripts.deployment.fast.fast_gr00t import FastGr00t
 import tensorrt
 import torch
 from torch import nn
+from torch._dynamo.utils import counters
 
 from adamo_model import embodiment
 from adamo_model.lora import ADAPTER, ADAPTER_CONFIG_FILE, ADAPTER_FILE, LoraSettings, apply_lora
 
 
 ENGINES = model_storage.CACHE_PATH / "gr00t" / "engines"
-COMPILE_CACHE = model_storage.CACHE_PATH / "gr00t" / "inductor"
+COMPILE_CACHE = model_storage.CACHE_PATH / "gr00t" / "compile_cache"
 
 
 PROCESSOR_FILES = ("processor_config.json", "statistics.json", "embodiment_id.json")
+
+
+def compile_cache_directory():
+    return COMPILE_CACHE / torch.cuda.get_device_name() / torch.__version__
+
+
+def load_compile_cache():
+    for path in compile_cache_directory().glob("*.bin"):
+        torch.compiler.load_cache_artifacts(path.read_bytes())
+
+
+def save_compile_cache():
+    directory = compile_cache_directory()
+    directory.mkdir(parents=True, exist_ok=True)
+    partial = directory / f"{uuid.uuid4().hex}.partial"
+    partial.write_bytes(torch.compiler.save_cache_artifacts()[0])
+    partial.rename(partial.with_suffix(".bin"))
 
 
 def assemble_model_dir(base_directory: Path, processor_directory: Path, directory: Path) -> Path:
@@ -77,11 +95,16 @@ class Gr00tN17Policy:
         self.action_sizes = mapping["action_sizes"]
         self.parts = mapping["embodiment"]
         self.refill_step_index = mapping["action_horizon"] // 2
+        self.saved_miss_count = 0
 
     def infer(self, observation, prompt, prefix=None, inference_delay=0, real_time_chunking=False):
         actions = self.fast.get_action(
             embodiment.gr00t_observation(observation, prompt, self.mapping["images"], self.parts)
         )
+        miss_count = counters["inductor"]["fxgraph_cache_miss"]
+        if miss_count > self.saved_miss_count:
+            save_compile_cache()
+            self.saved_miss_count = miss_count
         return embodiment.robot_actions(actions, self.parts)
 
 
@@ -111,9 +134,7 @@ def engine_directory(model_directory):
 
 
 def load(policy):
-    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(
-        COMPILE_CACHE / torch.cuda.get_device_name() / torch.__version__
-    )
+    load_compile_cache()
     weights = model_storage.fetch(policy["model_weights"])
     mapping = json.loads((weights / "mapping.json").read_text())
     model_directory = assemble_model_dir(
