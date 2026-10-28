@@ -200,6 +200,7 @@ class FastActionHead(torch.nn.Module):
         shift, scale = dit.proj_out_1(F.silu(temb)).chunk(2, dim=1)
         bufs["out_mod"] = torch.stack([scale, shift], 1).contiguous()  # (S, 2, D)
         bufs["timesteps"] = ts.view(self.n_steps, 1)
+        bufs["step_indices"] = torch.arange(self.n_steps, device=dev)
         bufs["pos_embs"] = (
             ah.position_embedding(torch.arange(self.horizon, device=dev)).unsqueeze(0).to(dt)
         )
@@ -222,13 +223,16 @@ class FastActionHead(torch.nn.Module):
             kv.append((self._heads(a.to_k(enc)), self._heads(a.to_v(enc))))
         return kv
 
-    def step(self, actions, state_features, kv, t: int, emb_id):
+    def step(self, actions, state_features, kv, t: torch.Tensor, emb_id):
         ah = self.ah
-        a_feat = ah.action_encoder(actions, self.timesteps[t], emb_id) + self.pos_embs
+        timestep = self.timesteps.index_select(0, t)[0]
+        mods = self.mods.index_select(0, t)[0]
+        out_mod = self.out_mod.index_select(0, t)[0]
+        a_feat = ah.action_encoder(actions, timestep, emb_id) + self.pos_embs
         x = torch.cat((state_features, a_feat), dim=1)
         D = x.shape[-1]
         for i, blk in enumerate(self.blocks):
-            scale, shift = self.mods[t, i, 0], self.mods[t, i, 1]
+            scale, shift = mods[i, 0], mods[i, 1]
             h = F.layer_norm(x, (D,), eps=blk.norm1.norm.eps) * (1 + scale) + shift
             a = blk.attn1
             q = self._heads(a.to_q(h))
@@ -242,7 +246,7 @@ class FastActionHead(torch.nn.Module):
             h = F.layer_norm(x, (D,), eps=blk.norm3.eps)
             x = x + blk.ff.net[2](blk.ff.net[0](h))
         dit = ah.model
-        scale, shift = self.out_mod[t, 0], self.out_mod[t, 1]
+        scale, shift = out_mod[0], out_mod[1]
         x = F.layer_norm(x, (D,), eps=dit.norm_out.eps) * (1 + scale) + shift
         out = dit.proj_out_2(x)
         pred = ah.action_decoder(out, emb_id)
@@ -385,9 +389,11 @@ class FastGr00t:
         vl = self.vlsa()["output"]
         state_features = self.ah.state_encoder(self.state, self.emb_id)
         kv = fah.cross_kv(vl)
-        actions = self.noise
+        actions = self.noise.clone()
         for t in range(fah.n_steps):
-            actions = c["step"](actions, state_features, kv, t, self.emb_id)
+            actions = c["step"](
+                actions, state_features, kv, fah.step_indices[t : t + 1], self.emb_id
+            )
         c["out"].copy_(actions)
 
     def _build(self, instruction):
