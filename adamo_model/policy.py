@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import tempfile
 
@@ -17,6 +18,7 @@ from adamo_model.lora import ADAPTER, ADAPTER_CONFIG_FILE, ADAPTER_FILE, LoraSet
 
 
 ENGINES = model_storage.CACHE_PATH / "gr00t" / "engines"
+COMPILE_CACHE = model_storage.CACHE_PATH / "gr00t" / "inductor"
 
 
 PROCESSOR_FILES = ("processor_config.json", "statistics.json", "embodiment_id.json")
@@ -109,6 +111,9 @@ def engine_directory(model_directory):
 
 
 def load(policy):
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(
+        COMPILE_CACHE / torch.cuda.get_device_name() / torch.__version__
+    )
     weights = model_storage.fetch(policy["model_weights"])
     mapping = json.loads((weights / "mapping.json").read_text())
     model_directory = assemble_model_dir(
