@@ -32,15 +32,15 @@ embodiment's layout, so the source embodiment's slot is left untouched.
 
 from dataclasses import asdict, dataclass
 
+from gr00t.model.modules.embodiment_conditioned_mlp import CategorySpecificLinear
 from peft import LoraConfig, inject_adapter_in_model
-from peft.tuners.lora import LoraLayer
 import torch
 from torch import nn
 
-from gr00t.model.modules.embodiment_conditioned_mlp import CategorySpecificLinear
-
 
 ADAPTER = "default"
+ADAPTER_FILE = "trainable.safetensors"
+ADAPTER_CONFIG_FILE = "lora_config.json"
 # Submodules of the action head whose linear layers get adapters instead of full training.
 LORA_MODULES = ("model", "vl_self_attention", "state_encoder", "action_encoder", "action_decoder")
 # Projector layers whose input rows / output columns are indexed by state or action dims.
@@ -153,26 +153,3 @@ def apply_lora(model: nn.Module, settings: LoraSettings) -> dict:
         elif name in trainable and not name.startswith(lora_prefixes):
             p.requires_grad = True
     return full
-
-
-def merged_state_dict(model: nn.Module, full: dict, slot: int) -> dict[str, torch.Tensor]:
-    """The model's state dict with adapters folded into the base weights and the projectors
-    written back into their multi-slot tensors, under the original key names, so it loads into a
-    plain GR00T model. Slots other than ``slot`` keep their original values."""
-    deltas = {}
-    for name, module in model.named_modules():
-        if isinstance(module, LoraLayer):
-            deltas[f"{name}.base_layer.weight"] = module.get_delta_weight(ADAPTER)
-    state = {}
-    for key, tensor in model.state_dict().items():
-        if "lora_" in key:
-            continue
-        if key in deltas:
-            tensor = tensor + deltas[key].to(tensor.dtype)
-        state[key.replace(".base_layer.", ".")] = tensor.detach()
-    for name, (W, b) in full.items():
-        W, b = W.clone(), b.clone()
-        W[slot] = state.pop(f"{name}.weight").T.cpu().to(W.dtype)
-        b[slot] = state.pop(f"{name}.bias").cpu().to(b.dtype)
-        state[f"{name}.W"], state[f"{name}.b"] = W, b
-    return state

@@ -33,20 +33,17 @@ DiT steps ~9.7 ms.
 
 ## LoRA
 
-LoRA adapters from the training server (`gr00t/train_server`, `--lora`; a `save_weights` directory
-with `trainable.safetensors` + `lora_config.json`) train only the action head, so:
+LoRA adapters trained with `adamo_model/lora.py` (a `save_weights` directory of `adamo_model`, with
+`trainable.safetensors` + `lora_config.json`) train only the action head, so:
 
-- they are **merged** into the action-head weights at load (`lora.load_lora_policy`), and inference
-  costs exactly what the base model costs;
+- they are **merged** into the action-head weights at load (`adamo_model.lora.load_lora_policy`),
+  and inference costs exactly what the base model costs;
 - the ViT and LLM engines are shared by every LoRA of the same base model, and the VL
-  self-attention runs in PyTorch inside the graph by default, so a LoRA needs no engine of its own;
-- `LoraSwapper.swap(dir)` + `FastGr00t.refresh_weights()` write another LoRA into the live weights
-  in place (~0.1 s including reading the file; ~40 ms from tensors already on the GPU) — no
-  recompile, no graph recapture.
+  self-attention runs in PyTorch inside the graph by default, so a LoRA needs no engine of its own.
 
 `model_path` must hold the base weights the LoRA was trained from **and** the embodiment's
-processor files. A LoRA save has neither; `lora.assemble_model_dir(base, processor_dir, out)`
-symlinks the base weights next to the processor files of e.g. a sampler save of the same run.
+processor files. A LoRA save has only the processor files; `adamo_model.lora.assemble_model_dir`
+symlinks the base weights next to them.
 
 ## Usage
 
@@ -57,24 +54,19 @@ python -m scripts.deployment.fast.build_engines --model-path <ckpt> --embodiment
 
 # check against eager PyTorch and time it
 python -m scripts.deployment.fast.benchmark --model-path <ckpt> --embodiment-tag new_embodiment \
-    --lora-dir <lora dir> --engine-dir trt_fast/engines --swap-lora-dir <lora dir>
+    --lora-dir <lora dir> --engine-dir trt_fast/engines
 ```
 
 ```python
 from scripts.deployment.fast.fast_gr00t import FastGr00t
-from scripts.deployment.fast.lora import load_lora_policy
+from adamo_model.lora import load_lora_policy
 
-policy, swapper = load_lora_policy(model_path, lora_dir, "new_embodiment")
+policy = load_lora_policy(model_path, lora_dir, "new_embodiment")
 fast = FastGr00t(policy, "trt_fast/engines", H=224, W=224)
 action = fast.get_action(observation)   # same observation/return format as Gr00tPolicy.get_action
-
-swapper.swap(other_lora_dir)            # later: switch LoRA in place
-fast.refresh_weights()
 ```
 
-The first call for a new instruction compiles and captures the graph (~1 min with a warm Inductor
-cache, ~6 min on a fresh machine); later calls replay it. Frames must have the size the engines
-were built for, and batch size is 1.
+The first call for a new instruction compiles and captures the graph; later calls replay it.
+Frames must have the size the engines were built for, and batch size is 1.
 
-`python -m runpod.abc_sim.adamo_bridge --engine-dir ... --lora-dir ...` drives the abc-sim robot over
-Adamo with this path.
+`adamo_model`'s policy drives robots over Adamo with this path.

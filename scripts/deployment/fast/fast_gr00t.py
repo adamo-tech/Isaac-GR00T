@@ -27,8 +27,7 @@ Exact rewrites of the action head (same math as AlternateVLDiT):
 
 The ViT and LLM engines depend only on the (frozen) backbone, so every action-head fine-tune or
 LoRA of the same base model shares them. The action head runs in PyTorch (torch.compile) inside the
-graph, reading the live module weights: writing new weights in place and calling
-``refresh_weights()`` switches checkpoints without recompiling or recapturing (see lora.py).
+graph.
 """
 
 import numpy as np
@@ -38,6 +37,14 @@ import torch
 import torch.nn.functional as F
 
 from .gpu_preproc import GpuImagePreprocessor
+
+RTC_RAMP_RATE = 3.0
+
+
+def velocity_strengths(frozen_steps, overlap_steps):
+    frozen_steps = min(frozen_steps, overlap_steps)
+    ramp = 1 - np.exp(-RTC_RAMP_RATE * np.linspace(0.0, 1.0, overlap_steps - frozen_steps + 2))
+    return np.concatenate([np.zeros(frozen_steps), (ramp / ramp[-1])[1:-1]]).astype(np.float32)
 
 
 def _rot6d_to_matrix(r6):
@@ -180,11 +187,11 @@ class FastActionHead(torch.nn.Module):
         self.cross_src = {
             i: ("text" if i % every == 0 else "image") for i in range(0, len(self.blocks), 2)
         }
-        self.refresh(init=True)
+        self.precompute()
 
     @torch.no_grad()
-    def refresh(self, init=False):
-        """(Re)compute the weight-dependent constants; in place after init, so captured graphs see them."""
+    def precompute(self):
+        """Compute the weight-dependent constants."""
         ah, dit = self.ah, self.ah.model
         dev, dt = dit.proj_out_2.weight.device, dit.proj_out_2.weight.dtype
         bufs = {}
@@ -201,14 +208,12 @@ class FastActionHead(torch.nn.Module):
         shift, scale = dit.proj_out_1(F.silu(temb)).chunk(2, dim=1)
         bufs["out_mod"] = torch.stack([scale, shift], 1).contiguous()  # (S, 2, D)
         bufs["timesteps"] = ts.view(self.n_steps, 1)
+        bufs["step_indices"] = torch.arange(self.n_steps, device=dev)
         bufs["pos_embs"] = (
             ah.position_embedding(torch.arange(self.horizon, device=dev)).unsqueeze(0).to(dt)
         )
         for name, value in bufs.items():
-            if init:
-                self.register_buffer(name, value)
-            else:
-                getattr(self, name).copy_(value)
+            self.register_buffer(name, value)
 
     def _heads(self, x):
         B, S, D = x.shape
@@ -226,13 +231,16 @@ class FastActionHead(torch.nn.Module):
             kv.append((self._heads(a.to_k(enc)), self._heads(a.to_v(enc))))
         return kv
 
-    def step(self, actions, state_features, kv, t: int, emb_id):
+    def step(self, actions, state_features, kv, t: torch.Tensor, emb_id, velocity_strength):
         ah = self.ah
-        a_feat = ah.action_encoder(actions, self.timesteps[t], emb_id) + self.pos_embs
+        timestep = self.timesteps.index_select(0, t)[0]
+        mods = self.mods.index_select(0, t)[0]
+        out_mod = self.out_mod.index_select(0, t)[0]
+        a_feat = ah.action_encoder(actions, timestep, emb_id) + self.pos_embs
         x = torch.cat((state_features, a_feat), dim=1)
         D = x.shape[-1]
         for i, blk in enumerate(self.blocks):
-            scale, shift = self.mods[t, i, 0], self.mods[t, i, 1]
+            scale, shift = mods[i, 0], mods[i, 1]
             h = F.layer_norm(x, (D,), eps=blk.norm1.norm.eps) * (1 + scale) + shift
             a = blk.attn1
             q = self._heads(a.to_q(h))
@@ -246,11 +254,11 @@ class FastActionHead(torch.nn.Module):
             h = F.layer_norm(x, (D,), eps=blk.norm3.eps)
             x = x + blk.ff.net[2](blk.ff.net[0](h))
         dit = ah.model
-        scale, shift = self.out_mod[t, 0], self.out_mod[t, 1]
+        scale, shift = out_mod[0], out_mod[1]
         x = F.layer_norm(x, (D,), eps=dit.norm_out.eps) * (1 + scale) + shift
         out = dit.proj_out_2(x)
         pred = ah.action_decoder(out, emb_id)
-        return actions + self.dt * pred[:, -self.horizon :]
+        return actions + self.dt * velocity_strength * pred[:, -self.horizon :]
 
 
 class FastGr00t:
@@ -309,6 +317,9 @@ class FastGr00t:
         self.noise = torch.zeros(
             (1, self.ah.config.action_horizon, self.ah.action_dim), dtype=self.dtype, device="cuda"
         )
+        self.prefix = torch.zeros_like(self.noise)
+        self.prefix_mask = torch.zeros_like(self.noise, dtype=torch.bool)
+        self.velocity_strength = torch.ones_like(self.noise)
         self.gen = torch.Generator(device="cuda").manual_seed(0)
         self.compile_step = compile_step
         self.graphs = {}
@@ -389,9 +400,11 @@ class FastGr00t:
         vl = self.vlsa()["output"]
         state_features = self.ah.state_encoder(self.state, self.emb_id)
         kv = fah.cross_kv(vl)
-        actions = self.noise
+        actions = torch.where(self.prefix_mask, self.prefix, self.noise)
         for t in range(fah.n_steps):
-            actions = c["step"](actions, state_features, kv, t, self.emb_id)
+            actions = c["step"](
+                actions, state_features, kv, fah.step_indices[t : t + 1], self.emb_id, self.velocity_strength
+            )
         c["out"].copy_(actions)
 
     def _build(self, instruction):
@@ -445,18 +458,18 @@ class FastGr00t:
         torch.cuda.current_stream().wait_stream(side)
         if self.llm_static:
             g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g), torch.inference_mode():
+            with torch.cuda.graph(g, capture_error_mode="thread_local"), torch.inference_mode():
                 self._forward(c, fah)
             c["graph"] = g
             return c
         # The stock LLM engine is not stream-capturable (data-dependent shapes in the deepstack
         # injection), so it is enqueued between two graphs; nothing waits on the host in between.
         ga, gb = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
-        with torch.cuda.graph(ga), torch.inference_mode():
+        with torch.cuda.graph(ga, capture_error_mode="thread_local"), torch.inference_mode():
             self._part_a(c)
         with torch.inference_mode():
             self.llm()
-        with torch.cuda.graph(gb), torch.inference_mode():
+        with torch.cuda.graph(gb, capture_error_mode="thread_local"), torch.inference_mode():
             self._part_b(c, fah)
         c["graph_a"], c["graph_b"] = ga, gb
         return c
@@ -471,12 +484,6 @@ class FastGr00t:
         c["graph_b"].replay()
 
     # ---------- public API ----------
-    def refresh_weights(self):
-        """Call after writing new action-head weights in place (e.g. LoraSwapper.swap): recomputes
-        the precomputed AdaLN/output modulations and position embeddings of every captured graph."""
-        for c in self.graphs.values():
-            c["fah"].refresh()
-
     def set_frames(self, frames_by_cam):
         """frames_by_cam: {cam_key: (T, H, W, 3) uint8}. Written into the pinned staging buffer."""
         i = 0
@@ -498,7 +505,7 @@ class FastGr00t:
         self.replay(c)
         return c["out"]
 
-    def get_action(self, observation):
+    def get_action(self, observation, action_prefix=None, inference_delay=0):
         """Same observation / return format as Gr00tPolicy.get_action (batch size 1)."""
         video = observation["video"]
         # frame order expected by the processor: time-major over (t, view)
@@ -515,6 +522,22 @@ class FastGr00t:
         s = np.concatenate([norm[k] for k in state_keys], -1).reshape(-1)
         st = np.zeros(self.state.shape[-1], np.float32)
         st[: s.shape[0]] = s  # (T*max_state_dim) flattening matches view(B, 1, -1) only for T=1
+        prefix = np.zeros(self.prefix.shape[1:], np.float32)
+        prefix_mask = np.zeros(prefix.shape, bool)
+        velocity_strength = np.ones_like(prefix)
+        if action_prefix is not None:
+            action_keys = self.mc["action"].modality_keys
+            length = len(action_prefix[action_keys[0]])
+            horizon = len(self.mc["action"].delta_indices)
+            padded = {k: np.pad(v, ((0, horizon - length), (0, 0))) for k, v in action_prefix.items()}
+            normalized = self.proc.state_action_processor.apply_action(padded, self.tag.value, state=raw_state)
+            values = np.concatenate([normalized[k] for k in action_keys], -1)[:length]
+            prefix[:length, : values.shape[1]] = values
+            prefix_mask[:length, : values.shape[1]] = True
+            velocity_strength[:length, : values.shape[1]] = velocity_strengths(inference_delay, length)[:, None]
+        self.prefix.copy_(torch.from_numpy(prefix)[None].to(self.dtype))
+        self.prefix_mask.copy_(torch.from_numpy(prefix_mask)[None])
+        self.velocity_strength.copy_(torch.from_numpy(velocity_strength)[None].to(self.dtype))
         lang = observation["language"][self.mc["language"].modality_keys[0]][0][0]
         out = self.infer_normalized(torch.from_numpy(st).view(1, 1, -1).to(self.dtype), lang)
         norm_action = out.float().cpu().numpy()
