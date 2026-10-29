@@ -117,7 +117,7 @@ def main(cfg: Config) -> None:
         actions = fast.noise.clone()
         step_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(step_graph):
-            c["step"](actions, state_features, kv, fah.step_indices[:1], fast.emb_id)
+            c["step"](actions, state_features, kv, fah.step_indices[:1], fast.emb_id, fast.velocity_strength)
     print("one flow step:    ", bench(step_graph.replay, cfg.iters))
     print("get_action (numpy):", bench(lambda: fast.get_action(obs), cfg.iters))
 
