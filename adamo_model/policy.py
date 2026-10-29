@@ -13,6 +13,11 @@ import tensorrt
 import torch
 from torch import nn
 from torch._dynamo.utils import counters
+from torch._inductor.runtime.triton_heuristics import (
+    CachingAutotuner,
+    check_autotune_cache,
+    triton_config_to_hashable,
+)
 
 from adamo_model import embodiment
 from adamo_model.lora import ADAPTER, ADAPTER_CONFIG_FILE, ADAPTER_FILE, LoraSettings, apply_lora
@@ -23,6 +28,28 @@ COMPILE_CACHE = model_storage.CACHE_PATH / "gr00t" / "compile_cache"
 
 
 PROCESSOR_FILES = ("processor_config.json", "statistics.json", "embodiment_id.json")
+
+
+def recheck_autotune_cache(self, reload_kernel_from_src):
+    configs = [result.config for result in self.compile_results]
+    cached_configs, _, self.autotune_cache_info = check_autotune_cache(
+        configs, self.filename, self.inductor_meta
+    )
+    if len(cached_configs) == 1:
+        best_config = cached_configs[0]
+        found_by_coordesc = getattr(best_config, "found_by_coordesc", False)
+        best_config_hash = triton_config_to_hashable(best_config)
+        for compile_result in self.compile_results:
+            if triton_config_to_hashable(compile_result.config) == best_config_hash:
+                compile_result.config.found_by_coordesc = found_by_coordesc
+                self.compile_results = [compile_result]
+                return
+        if self.fn.fn is None:
+            self.fn = reload_kernel_from_src().fn
+        self.compile_results = [self._precompile_config(best_config)]
+
+
+CachingAutotuner.recheck_autotune_cache = recheck_autotune_cache
 
 
 def compile_cache_directory():
