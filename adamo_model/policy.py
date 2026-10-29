@@ -1,12 +1,15 @@
+import hashlib
 import json
 from pathlib import Path
 import tempfile
 import uuid
 
+import gr00t.model
 from gr00t.policy.gr00t_policy import Gr00tPolicy
 from peft.tuners.lora import LoraLayer
 from runtime import model_storage
 from safetensors.torch import load_file
+from scripts.deployment import fast
 from scripts.deployment.fast.build_engines import Config, main as build_engines
 from scripts.deployment.fast.fast_gr00t import FastGr00t
 import tensorrt
@@ -25,6 +28,7 @@ from adamo_model.lora import ADAPTER, ADAPTER_CONFIG_FILE, ADAPTER_FILE, LoraSet
 
 ENGINES = model_storage.CACHE_PATH / "gr00t" / "engines"
 COMPILE_CACHE = model_storage.CACHE_PATH / "gr00t" / "compile_cache"
+GRAPH_SOURCES = (Path(gr00t.model.__file__).parent, Path(fast.__file__).parent)
 
 
 PROCESSOR_FILES = ("processor_config.json", "statistics.json", "embodiment_id.json")
@@ -52,17 +56,20 @@ def recheck_autotune_cache(self, reload_kernel_from_src):
 CachingAutotuner.recheck_autotune_cache = recheck_autotune_cache
 
 
-def compile_cache_directory():
-    return COMPILE_CACHE / torch.cuda.get_device_name() / torch.__version__
+def compile_cache_directory(prompt):
+    paths = sorted(path for directory in GRAPH_SOURCES for path in directory.rglob("*.py"))
+    sources = b"".join(path.read_bytes() for path in paths)
+    digest = hashlib.sha256(sources + prompt.encode()).hexdigest()[:16]
+    return COMPILE_CACHE / torch.cuda.get_device_name() / torch.__version__ / digest
 
 
-def load_compile_cache():
-    for path in compile_cache_directory().glob("*.bin"):
+def load_compile_cache(prompt):
+    for path in compile_cache_directory(prompt).glob("*.bin"):
         torch.compiler.load_cache_artifacts(path.read_bytes())
 
 
-def save_compile_cache():
-    directory = compile_cache_directory()
+def save_compile_cache(prompt):
+    directory = compile_cache_directory(prompt)
     directory.mkdir(parents=True, exist_ok=True)
     partial = directory / f"{uuid.uuid4().hex}.partial"
     partial.write_bytes(torch.compiler.save_cache_artifacts()[0])
@@ -125,13 +132,15 @@ class Gr00tN17Policy:
         self.saved_miss_count = 0
 
     def infer(self, observation, prompt, prefix=None, inference_delay=0, real_time_chunking=True):
+        if prompt not in self.fast.graphs:
+            load_compile_cache(prompt)
         action_prefix = None if prefix is None or not real_time_chunking else {name: prefix[:, start:end] for name, (start, end) in embodiment.ranges(self.parts).items()}
         actions = self.fast.get_action(
             embodiment.gr00t_observation(observation, prompt, self.mapping["images"], self.parts), action_prefix, inference_delay
         )
         miss_count = counters["inductor"]["fxgraph_cache_miss"]
         if miss_count > self.saved_miss_count:
-            save_compile_cache()
+            save_compile_cache(prompt)
             self.saved_miss_count = miss_count
         return embodiment.robot_actions(actions, self.parts)
 
@@ -162,7 +171,6 @@ def engine_directory(model_directory):
 
 
 def load(policy):
-    load_compile_cache()
     weights = model_storage.fetch(policy["model_weights"])
     mapping = json.loads((weights / "mapping.json").read_text())
     model_directory = assemble_model_dir(
