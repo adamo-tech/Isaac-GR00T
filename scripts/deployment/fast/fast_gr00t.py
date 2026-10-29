@@ -38,6 +38,14 @@ import torch.nn.functional as F
 
 from .gpu_preproc import GpuImagePreprocessor
 
+RTC_RAMP_RATE = 3.0
+
+
+def velocity_strengths(frozen_steps, overlap_steps):
+    frozen_steps = min(frozen_steps, overlap_steps)
+    ramp = 1 - np.exp(-RTC_RAMP_RATE * np.linspace(0.0, 1.0, overlap_steps - frozen_steps + 2))
+    return np.concatenate([np.zeros(frozen_steps), (ramp / ramp[-1])[1:-1]]).astype(np.float32)
+
 
 def _rot6d_to_matrix(r6):
     """(..., 6) first two rows of a rotation matrix -> (..., 3, 3), Gram-Schmidt as in pose.py."""
@@ -223,7 +231,7 @@ class FastActionHead(torch.nn.Module):
             kv.append((self._heads(a.to_k(enc)), self._heads(a.to_v(enc))))
         return kv
 
-    def step(self, actions, state_features, kv, t: torch.Tensor, emb_id):
+    def step(self, actions, state_features, kv, t: torch.Tensor, emb_id, velocity_strength):
         ah = self.ah
         timestep = self.timesteps.index_select(0, t)[0]
         mods = self.mods.index_select(0, t)[0]
@@ -250,7 +258,7 @@ class FastActionHead(torch.nn.Module):
         x = F.layer_norm(x, (D,), eps=dit.norm_out.eps) * (1 + scale) + shift
         out = dit.proj_out_2(x)
         pred = ah.action_decoder(out, emb_id)
-        return actions + self.dt * pred[:, -self.horizon :]
+        return actions + self.dt * velocity_strength * pred[:, -self.horizon :]
 
 
 class FastGr00t:
@@ -309,6 +317,9 @@ class FastGr00t:
         self.noise = torch.zeros(
             (1, self.ah.config.action_horizon, self.ah.action_dim), dtype=self.dtype, device="cuda"
         )
+        self.prefix = torch.zeros_like(self.noise)
+        self.prefix_mask = torch.zeros_like(self.noise, dtype=torch.bool)
+        self.velocity_strength = torch.ones_like(self.noise)
         self.gen = torch.Generator(device="cuda").manual_seed(0)
         self.compile_step = compile_step
         self.graphs = {}
@@ -389,10 +400,10 @@ class FastGr00t:
         vl = self.vlsa()["output"]
         state_features = self.ah.state_encoder(self.state, self.emb_id)
         kv = fah.cross_kv(vl)
-        actions = self.noise.clone()
+        actions = torch.where(self.prefix_mask, self.prefix, self.noise)
         for t in range(fah.n_steps):
             actions = c["step"](
-                actions, state_features, kv, fah.step_indices[t : t + 1], self.emb_id
+                actions, state_features, kv, fah.step_indices[t : t + 1], self.emb_id, self.velocity_strength
             )
         c["out"].copy_(actions)
 
@@ -494,7 +505,7 @@ class FastGr00t:
         self.replay(c)
         return c["out"]
 
-    def get_action(self, observation):
+    def get_action(self, observation, action_prefix=None, inference_delay=0):
         """Same observation / return format as Gr00tPolicy.get_action (batch size 1)."""
         video = observation["video"]
         # frame order expected by the processor: time-major over (t, view)
@@ -511,6 +522,22 @@ class FastGr00t:
         s = np.concatenate([norm[k] for k in state_keys], -1).reshape(-1)
         st = np.zeros(self.state.shape[-1], np.float32)
         st[: s.shape[0]] = s  # (T*max_state_dim) flattening matches view(B, 1, -1) only for T=1
+        prefix = np.zeros(self.prefix.shape[1:], np.float32)
+        prefix_mask = np.zeros(prefix.shape, bool)
+        velocity_strength = np.ones_like(prefix)
+        if action_prefix is not None:
+            action_keys = self.mc["action"].modality_keys
+            length = len(action_prefix[action_keys[0]])
+            horizon = len(self.mc["action"].delta_indices)
+            padded = {k: np.pad(v, ((0, horizon - length), (0, 0))) for k, v in action_prefix.items()}
+            normalized = self.proc.state_action_processor.apply_action(padded, self.tag.value, state=raw_state)
+            values = np.concatenate([normalized[k] for k in action_keys], -1)[:length]
+            prefix[:length, : values.shape[1]] = values
+            prefix_mask[:length, : values.shape[1]] = True
+            velocity_strength[:length, : values.shape[1]] = velocity_strengths(inference_delay, length)[:, None]
+        self.prefix.copy_(torch.from_numpy(prefix)[None].to(self.dtype))
+        self.prefix_mask.copy_(torch.from_numpy(prefix_mask)[None])
+        self.velocity_strength.copy_(torch.from_numpy(velocity_strength)[None].to(self.dtype))
         lang = observation["language"][self.mc["language"].modality_keys[0]][0][0]
         out = self.infer_normalized(torch.from_numpy(st).view(1, 1, -1).to(self.dtype), lang)
         norm_action = out.float().cpu().numpy()

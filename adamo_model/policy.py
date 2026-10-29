@@ -124,9 +124,10 @@ class Gr00tN17Policy:
         self.refill_step_index = mapping["action_horizon"] // 2
         self.saved_miss_count = 0
 
-    def infer(self, observation, prompt, prefix=None, inference_delay=0, real_time_chunking=False):
+    def infer(self, observation, prompt, prefix=None, inference_delay=0, real_time_chunking=True):
+        action_prefix = None if prefix is None or not real_time_chunking else {name: prefix[:, start:end] for name, (start, end) in embodiment.ranges(self.parts).items()}
         actions = self.fast.get_action(
-            embodiment.gr00t_observation(observation, prompt, self.mapping["images"], self.parts)
+            embodiment.gr00t_observation(observation, prompt, self.mapping["images"], self.parts), action_prefix, inference_delay
         )
         miss_count = counters["inductor"]["fxgraph_cache_miss"]
         if miss_count > self.saved_miss_count:
