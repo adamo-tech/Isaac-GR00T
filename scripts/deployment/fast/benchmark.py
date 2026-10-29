@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import time
 
-from adamo_model.lora import attach_lora, merge_lora, read_lora
+from adamo_model.policy import attach_lora, merge_lora, read_lora
 from gr00t.policy.gr00t_policy import Gr00tPolicy
 import numpy as np
 import torch
@@ -110,6 +110,15 @@ def main(cfg: Config) -> None:
     compare("fast vs eager")
     c = fast.graphs[instruction]
     print("graph replay:     ", bench(lambda: fast.replay(c), cfg.iters))
+    fah = c["fah"]
+    with torch.inference_mode():
+        state_features = ah.state_encoder(fast.state, fast.emb_id)
+        kv = fah.cross_kv(fast.vlsa.out["output"])
+        actions = fast.noise.clone()
+        step_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(step_graph):
+            c["step"](actions, state_features, kv, fah.step_indices[:1], fast.emb_id)
+    print("one flow step:    ", bench(step_graph.replay, cfg.iters))
     print("get_action (numpy):", bench(lambda: fast.get_action(obs), cfg.iters))
 
 

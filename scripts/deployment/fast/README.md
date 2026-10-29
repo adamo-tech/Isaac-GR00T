@@ -66,8 +66,7 @@ fast = FastGr00t(policy, "trt_fast/engines", H=224, W=224)
 action = fast.get_action(observation)   # same observation/return format as Gr00tPolicy.get_action
 ```
 
-The first call for a new instruction compiles and captures the graph (~1 min with a warm Inductor
-cache, ~6 min on a fresh machine); later calls replay it. Frames must have the size the engines
-were built for, and batch size is 1.
+The first call for a new instruction compiles and captures the graph; later calls replay it.
+Frames must have the size the engines were built for, and batch size is 1.
 
 `adamo_model`'s policy drives robots over Adamo with this path.
