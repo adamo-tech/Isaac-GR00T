@@ -25,11 +25,12 @@ MAPPING_KEYS = ("images", "state", "action", "frame_rate", "state_sizes", "actio
 def step_data(datum, frames, part_ranges):
     frame_images = {}
     images = {}
+    image_keys = list(datum["images"])
 
     for key, image in datum["images"].items():
         if isinstance(image, dict):
             pointer = (image["dataset"], image["episode"], image["frame"])
-            frame_images[pointer] = frame_images.get(pointer) or frames.frame(*pointer)
+            frame_images[pointer] = frame_images.get(pointer) or frames.frame(*pointer, image_keys)
             image = frame_images[pointer][key]
 
         if isinstance(image, bytes):
@@ -59,6 +60,7 @@ def step_data(datum, frames, part_ranges):
 class Trainer:
     base_model = "nvidia/GR00T-N1.7"
     action_horizon = embodiment.ACTION_HORIZON
+    is_episode_end_padded = False
 
     def __init__(self, rank, frames, state_directory=None, seed=None, parts=None):
         self.rank = rank
@@ -69,6 +71,7 @@ class Trainer:
         self.episodes = []
         self.processor = None
         self.step_count = 0
+        self.loss_weight = 0.0
         self.preparers = concurrent.futures.ThreadPoolExecutor(max_workers=PREPARE_THREAD_COUNT)
 
         if state_directory:
@@ -125,14 +128,18 @@ class Trainer:
         if self.episodes:
             return self.episodes
 
-        image = next(iter(data[0]["images"].values()))
+        images = [image for datum in data for image in datum["images"].values()]
 
-        if not isinstance(image, dict):
+        if not isinstance(images[0], dict):
             raise ValueError(
                 "This run has no normalization stats. Call `training.compute_norm_stats(episodes)` before `forward_backward`."
             )
 
-        return self.frames.episodes(image["dataset"])
+        return [
+            episode
+            for dataset_id in dict.fromkeys(image["dataset"] for image in images)
+            for episode in self.frames.episodes(dataset_id)
+        ]
 
     def check_mapping(self, datum):
         mapping = {
@@ -185,8 +192,8 @@ class Trainer:
         ]
 
     def forward_backward(self, batches, example_count):
-        total = sum(float(batch["action_mask"].sum()) for batch in batches)
-        loss = 0.0
+        loss_sum = 0.0
+        weight_sum = 0.0
 
         for batch in batches:
             with torch.autocast(
@@ -194,11 +201,13 @@ class Trainer:
             ):
                 output = self.model(batch)
 
-            weight = float(output["action_mask"].detach().float().sum()) / total
+            weight = float(output["action_mask"].detach().float().sum())
             (output["loss"] * weight).backward()
-            loss += output["loss"].item() * weight
+            loss_sum += output["loss"].detach() * weight
+            weight_sum += weight
 
-        return {"loss": loss, "metrics": {}}
+        self.loss_weight += weight_sum
+        return {"loss": float(loss_sum) / weight_sum, "metrics": {}}
 
     def optim_step(self, adam_params):
         for group in self.optimizer.param_groups:
@@ -209,6 +218,11 @@ class Trainer:
                 weight_decay=adam_params["weight_decay"],
             )
 
+        for parameter in self.params:
+            if parameter.grad is not None:
+                parameter.grad /= self.loss_weight
+
+        self.loss_weight = 0.0
         clip = adam_params["grad_clip_norm"]
         grad_norm = torch.nn.utils.clip_grad_norm_(self.params, clip if clip > 0 else math.inf)
         self.optimizer.step()

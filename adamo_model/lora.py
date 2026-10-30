@@ -134,6 +134,7 @@ def apply_lora(model: nn.Module, settings: LoraSettings) -> dict:
             f"action_head.{sub}.{name}"
             for name, child in module.named_modules()
             if isinstance(child, nn.Linear)
+            and not (settings.init_slot is None and isinstance(child, SlotLinear))
         ]
     if not targets:
         raise RuntimeError("No linear layers found for LoRA in the action head")
@@ -152,4 +153,8 @@ def apply_lora(model: nn.Module, settings: LoraSettings) -> dict:
             p.requires_grad = True
         elif name in trainable and not name.startswith(lora_prefixes):
             p.requires_grad = True
+    if settings.init_slot is None:
+        for module in model.action_head.modules():
+            if isinstance(module, SlotLinear):
+                module.requires_grad_(True)
     return full

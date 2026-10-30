@@ -145,16 +145,17 @@ class Gr00tN17Policy:
         return embodiment.robot_actions(actions, self.parts)
 
 
-def engine_directory(model_directory):
+def engine_directory(model_directory, camera_count):
     directory = (
         ENGINES
         / torch.cuda.get_device_name()
         / tensorrt.__version__
         / f"{embodiment.IMAGE_SIZE}x{embodiment.IMAGE_SIZE}"
+        / f"{camera_count}-cameras"
     )
 
     if not directory.exists():
-        partial = directory.with_name(f"{directory.name}.partial")
+        partial = directory.with_name(f"{directory.name}.{uuid.uuid4().hex}.partial")
         build_engines(
             Config(
                 model_path=str(model_directory),
@@ -179,7 +180,7 @@ def load(policy):
     gr00t_policy = load_lora_policy(model_directory, weights, embodiment.EMBODIMENT_TAG.value)
     fast = FastGr00t(
         gr00t_policy,
-        str(engine_directory(model_directory)),
+        str(engine_directory(model_directory, len(mapping["images"]))),
         H=embodiment.IMAGE_SIZE,
         W=embodiment.IMAGE_SIZE,
     )
