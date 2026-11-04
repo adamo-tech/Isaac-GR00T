@@ -8,6 +8,7 @@ import gr00t.model
 from gr00t.policy.gr00t_policy import Gr00tPolicy
 from peft.tuners.lora import LoraLayer
 from runtime import model_storage
+from runtime.embodiment import action_parts
 from safetensors.torch import load_file
 from scripts.deployment import fast
 from scripts.deployment.fast.build_engines import Config, main as build_engines
@@ -134,7 +135,7 @@ class Gr00tN17Policy:
     def infer(self, observation, prompt, prefix=None, inference_delay=0, real_time_chunking=True):
         if prompt not in self.fast.graphs:
             load_compile_cache(prompt)
-        action_prefix = None if prefix is None or not real_time_chunking else {name: prefix[:, start:end] for name, (start, end) in embodiment.ranges(self.parts).items()}
+        action_prefix = None if prefix is None or not real_time_chunking else {name: prefix[:, start:end] for name, (start, end) in embodiment.ranges(action_parts(self.parts)).items()}
         actions = self.fast.get_action(
             embodiment.gr00t_observation(observation, prompt, self.mapping["images"], self.parts), action_prefix, inference_delay
         )

@@ -18,6 +18,7 @@ from gr00t.model.gr00t_n1d7.setup import Gr00tN1d7Pipeline
 import numpy
 from PIL import Image
 from runtime import model_storage
+from runtime.embodiment import action_parts, is_relative, state_parts
 
 from adamo_model.lora import LoraSettings
 
@@ -36,22 +37,23 @@ def ranges(parts):
 
 
 def modality_config(image_keys, parts):
-    names = [part["name"] for part in parts]
     return {
         "video": ModalityConfig(delta_indices=[0], modality_keys=image_keys),
-        "state": ModalityConfig(delta_indices=[0], modality_keys=names),
+        "state": ModalityConfig(
+            delta_indices=[0], modality_keys=[part["name"] for part in state_parts(parts)]
+        ),
         "action": ModalityConfig(
             delta_indices=list(range(ACTION_HORIZON)),
-            modality_keys=names,
+            modality_keys=[part["name"] for part in action_parts(parts)],
             action_configs=[
                 ActionConfig(
                     rep=ActionRepresentation.RELATIVE
-                    if part["kind"] == "joints"
+                    if is_relative(part)
                     else ActionRepresentation.ABSOLUTE,
                     type=ActionType.NON_EEF,
                     format=ActionFormat.DEFAULT,
                 )
-                for part in parts
+                for part in action_parts(parts)
             ],
         ),
         "language": ModalityConfig(delta_indices=[0], modality_keys=[LANGUAGE_KEY]),
@@ -96,18 +98,19 @@ def statistics(episodes, mapping, parts):
     states = [columns(episode, mapping["state"]) for episode in episodes]
     actions = [columns(episode, mapping["action"]) for episode in episodes]
     all_states, all_actions = numpy.vstack(states), numpy.vstack(actions)
-    part_ranges = ranges(parts)
+    action_ranges = ranges(action_parts(parts))
     return {
         "state": {
-            name: summary(all_states[:, start:end]) for name, (start, end) in part_ranges.items()
+            name: summary(all_states[:, start:end])
+            for name, (start, end) in ranges(state_parts(parts)).items()
         },
         "action": {
-            name: summary(all_actions[:, start:end]) for name, (start, end) in part_ranges.items()
+            name: summary(all_actions[:, start:end]) for name, (start, end) in action_ranges.items()
         },
         "relative_action": {
-            part["name"]: summary(relative_chunks(states, actions, *part_ranges[part["name"]]))
-            for part in parts
-            if part["kind"] == "joints"
+            part["name"]: summary(relative_chunks(states, actions, *action_ranges[part["name"]]))
+            for part in action_parts(parts)
+            if is_relative(part)
         },
     }
 
@@ -155,46 +158,50 @@ def pretrained_layouts(base_checkpoint):
     return layouts
 
 
+def layout_map(layout, parts):
+    free = list(layout)
+    offsets = []
+
+    for part in parts:
+        match = next(
+            (
+                candidate
+                for candidate in free
+                if (candidate["kind"], candidate["side"], candidate["size"])
+                == (part["kind"], part["side"], part["size"])
+            ),
+            None,
+        )
+
+        if match is None:
+            return None
+
+        free.remove(match)
+        offsets.append(match["offset"])
+
+    return [offset + index for part, offset in zip(parts, offsets) for index in range(part["size"])]
+
+
 def pretrained_start(base_checkpoint, parts):
     for tag, layout in pretrained_layouts(base_checkpoint).items():
-        free = list(layout)
-        offsets = []
+        state_map = layout_map(layout, state_parts(parts))
+        action_map = layout_map(layout, action_parts(parts))
 
-        for part in parts:
-            match = next(
-                (
-                    candidate
-                    for candidate in free
-                    if (candidate["kind"], candidate["side"], candidate["size"])
-                    == (part["kind"], part["side"], part["size"])
-                ),
-                None,
-            )
+        if state_map is not None and action_map is not None:
+            return tag, state_map, action_map
 
-            if match is None:
-                break
-
-            free.remove(match)
-            offsets.append(match["offset"])
-        else:
-            return tag, [
-                offset + index
-                for part, offset in zip(parts, offsets)
-                for index in range(part["size"])
-            ]
-
-    return None, None
+    return None, None, None
 
 
 def lora_settings(rank, processor, base_checkpoint, parts):
-    tag, layout = pretrained_start(base_checkpoint, parts)
+    tag, state_map, action_map = pretrained_start(base_checkpoint, parts)
     return LoraSettings(
         rank=rank,
         alpha=2 * rank,
         embodiment_id=processor.embodiment_id_mapping[EMBODIMENT_TAG.value],
         init_slot=None if tag is None else processor.embodiment_id_mapping[tag],
-        state_map=layout,
-        action_map=layout,
+        state_map=state_map,
+        action_map=action_map,
     )
 
 
@@ -218,16 +225,17 @@ def gr00t_observation(observation, prompt, image_keys, parts):
     return {
         "video": {key: letterbox(observation["images"][key])[None, None] for key in image_keys},
         "state": {
-            name: state[start:end][None, None] for name, (start, end) in ranges(parts).items()
+            name: state[start:end][None, None]
+            for name, (start, end) in ranges(state_parts(parts)).items()
         },
         "language": {LANGUAGE_KEY: [[prompt]]},
     }
 
 
 def robot_actions(actions, parts):
-    return numpy.concatenate([actions[part["name"]][0] for part in parts], axis=1).astype(
-        numpy.float32
-    )
+    return numpy.concatenate(
+        [actions[part["name"]][0] for part in action_parts(parts)], axis=1
+    ).astype(numpy.float32)
 
 
 def pipeline(base_checkpoint):
