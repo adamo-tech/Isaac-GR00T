@@ -573,9 +573,9 @@ class Gr00tN1d7(PreTrainedModel):
         # Move to device and dtype
         def to_device_with_dtype(x):
             if torch.is_floating_point(x):
-                return x.to(self.device, dtype=self.dtype)
+                return x.to(self.device, dtype=self.dtype, non_blocking=True)
             else:
-                return x.to(self.device)
+                return x.to(self.device, non_blocking=True)
 
         backbone_inputs = tree.map_structure(to_device_with_dtype, backbone_inputs)
         action_inputs = tree.map_structure(to_device_with_dtype, action_inputs)

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import types
 
 from huggingface_hub.errors import GatedRepoError
 import torch
@@ -132,6 +133,16 @@ def _assign_inv_freq(
     return True
 
 
+def _grid_cached(name: str):
+    def cached(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        key = (name, tuple(map(tuple, grid_thw.tolist())))
+        if key not in self.grid_embeddings:
+            self.grid_embeddings[key] = getattr(type(self), name)(self, grid_thw)
+        return self.grid_embeddings[key]
+
+    return cached
+
+
 class Qwen3Backbone(torch.nn.Module):
     def __init__(
         self,
@@ -209,6 +220,16 @@ class Qwen3Backbone(torch.nn.Module):
 
         # Restore the fast vision patch-embed kernel on torch>=2.9. See method docstring.
         self._apply_vision_patch_embed_channels_last()
+
+        if not tune_visual:
+            self._cache_vision_grid_embeddings()
+
+    def _cache_vision_grid_embeddings(self) -> None:
+        visual = self.model.visual
+        visual.grid_embeddings = {}
+
+        for name in ("rot_pos_emb", "fast_pos_embed_interpolate"):
+            setattr(visual, name, types.MethodType(_grid_cached(name), visual))
 
     def _apply_vision_patch_embed_channels_last(self) -> None:
         """Force the Qwen3-VL vision patch-embed ``Conv3d`` to ``channels_last_3d``.
@@ -357,8 +378,14 @@ class Qwen3Backbone(torch.nn.Module):
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
         # 0. Set frozen module to eval
-        keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
-        vl_input = {k: vl_input[k] for k in keys_to_use}
+        keys_to_use = [
+            "input_ids",
+            "attention_mask",
+            "pixel_values",
+            "image_grid_thw",
+            "position_ids",
+        ]
+        vl_input = {k: vl_input[k] for k in keys_to_use if k in vl_input}
         outputs = self.model(**vl_input, output_hidden_states=True, logits_to_keep=1)
         outputs = outputs.hidden_states[-1]
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
