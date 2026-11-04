@@ -10,6 +10,7 @@ import random
 from gr00t.data.types import MessageType, VLAStepData
 import numpy
 from PIL import Image
+from runtime.embodiment import action_parts, state_parts
 from safetensors.torch import load_file, save_file
 import torch
 from training.flops import counted_flops
@@ -26,7 +27,7 @@ OPTIMIZER_FILE = "optimizer.pt"
 MAPPING_KEYS = ("images", "state", "action", "frame_rate", "state_sizes", "action_sizes")
 
 
-def step_data(datum, frames, part_ranges):
+def step_data(datum, frames, state_ranges, action_ranges):
     frame_images = {}
     images = {}
     image_keys = list(datum["images"])
@@ -54,8 +55,8 @@ def step_data(datum, frames, part_ranges):
     )
     return VLAStepData(
         images=images,
-        states={name: state[start:end][None] for name, (start, end) in part_ranges.items()},
-        actions={name: actions[:, start:end] for name, (start, end) in part_ranges.items()},
+        states={name: state[start:end][None] for name, (start, end) in state_ranges.items()},
+        actions={name: actions[:, start:end] for name, (start, end) in action_ranges.items()},
         text=datum["prompt"],
         embodiment=embodiment.EMBODIMENT_TAG,
     )
@@ -102,7 +103,8 @@ class Trainer:
             self.step_count = saved["step_count"]
             self.parts = saved["embodiment"]
 
-        self.part_ranges = embodiment.ranges(self.parts)
+        self.state_ranges = embodiment.ranges(state_parts(self.parts))
+        self.action_ranges = embodiment.ranges(action_parts(self.parts))
         set_seed(self.seed)
         self.base_checkpoint = embodiment.base_checkpoint()
         self.pipeline = embodiment.pipeline(self.base_checkpoint)
@@ -202,11 +204,12 @@ class Trainer:
                 f"This run reads {self.mapping}, and a datum has {mapping}. A run keeps one set of image, state and action keys and one frame rate."
             )
 
-        part_size = sum(part["size"] for part in self.parts)
+        state_size = sum(part["size"] for part in state_parts(self.parts))
+        action_size = sum(part["size"] for part in action_parts(self.parts))
 
-        if sum(mapping["state_sizes"]) != part_size or sum(mapping["action_sizes"]) != part_size:
+        if sum(mapping["state_sizes"]) != state_size or sum(mapping["action_sizes"]) != action_size:
             raise ValueError(
-                f"The embodiment has {part_size} values ({', '.join(f'{part["name"]}: {part["size"]}' for part in self.parts)}), and a datum has {sum(mapping['state_sizes'])} state and {sum(mapping['action_sizes'])} action values. State and action follow the embodiment's parts, in order."
+                f"The embodiment has {state_size} state and {action_size} action values ({', '.join(f'{part["name"]}: {part["size"]} {part.get("vector", "both")}' for part in self.parts)}), and a datum has {sum(mapping['state_sizes'])} state and {sum(mapping['action_sizes'])} action values. State and action follow the embodiment's parts, in order."
             )
 
         horizon = len(next(iter(datum["loss_fn_inputs"].values())))
@@ -227,7 +230,11 @@ class Trainer:
 
         steps = list(
             self.preparers.map(
-                step_data, data, itertools.repeat(self.frames), itertools.repeat(self.part_ranges)
+                step_data,
+                data,
+                itertools.repeat(self.frames),
+                itertools.repeat(self.state_ranges),
+                itertools.repeat(self.action_ranges),
             )
         )
         examples = list(self.processors.map(processed, steps))
