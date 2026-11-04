@@ -3,6 +3,8 @@ import io
 import itertools
 import json
 import math
+import multiprocessing
+import os
 import random
 
 from gr00t.data.types import MessageType, VLAStepData
@@ -10,6 +12,7 @@ import numpy
 from PIL import Image
 from safetensors.torch import load_file, save_file
 import torch
+from training.flops import counted_flops
 from transformers import set_seed
 
 from adamo_model import embodiment
@@ -17,6 +20,7 @@ from adamo_model.lora import ADAPTER_CONFIG_FILE, ADAPTER_FILE, apply_lora
 
 
 PREPARE_THREAD_COUNT = 8
+PREPARE_PROCESS_COUNT = 8
 CHUNK_SIZE = 256
 OPTIMIZER_FILE = "optimizer.pt"
 MAPPING_KEYS = ("images", "state", "action", "frame_rate", "state_sizes", "action_sizes")
@@ -57,6 +61,22 @@ def step_data(datum, frames, part_ranges):
     )
 
 
+def start_processor_worker(base_checkpoint, image_keys, parts, statistics, seed):
+    global worker_processor
+    worker_processor = embodiment.processor(
+        embodiment.pipeline(base_checkpoint), image_keys, parts, statistics
+    )
+    worker_processor.train()
+    worker_seed = (seed + os.getpid()) % 2**32
+    random.seed(worker_seed)
+    numpy.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+
+
+def processed(step):
+    return worker_processor([{"type": MessageType.EPISODE_STEP.value, "content": step}])
+
+
 class Trainer:
     base_model = "nvidia/GR00T-N1.7"
     action_horizon = embodiment.ACTION_HORIZON
@@ -72,6 +92,7 @@ class Trainer:
         self.processor = None
         self.step_count = 0
         self.loss_weight = 0.0
+        self.example_flops = None
         self.preparers = concurrent.futures.ThreadPoolExecutor(max_workers=PREPARE_THREAD_COUNT)
 
         if state_directory:
@@ -91,6 +112,7 @@ class Trainer:
             torch.backends.cudnn.allow_tf32 = True
 
         self.model = self.pipeline._create_model()
+        self.vision_language = self.model.backbone.model
 
         if state_directory:
             statistics = json.loads((state_directory / "statistics.json").read_text())
@@ -114,15 +136,38 @@ class Trainer:
             self.pipeline, self.mapping["images"], self.parts, statistics
         )
         self.processor.train()
+        self.processors = concurrent.futures.ProcessPoolExecutor(
+            PREPARE_PROCESS_COUNT,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=start_processor_worker,
+            initargs=(
+                self.base_checkpoint,
+                self.mapping["images"],
+                self.parts,
+                statistics,
+                self.seed,
+            ),
+        )
         self.lora = embodiment.lora_settings(
             self.rank, self.processor, self.base_checkpoint, self.parts
         )
         apply_lora(self.model, self.lora)
         self.model.to("cuda").train()
+
+        for module in [
+            *(block.mlp for block in self.vision_language.visual.blocks),
+            *(
+                module
+                for layer in self.vision_language.language_model.layers
+                for module in (layer.input_layernorm, layer.post_attention_layernorm, layer.mlp)
+            ),
+        ]:
+            module.compile()
+
         self.params = [
             parameter for parameter in self.model.parameters() if parameter.requires_grad
         ]
-        self.optimizer = torch.optim.AdamW(self.params, lr=0.0)
+        self.optimizer = torch.optim.AdamW(self.params, lr=0.0, fused=True)
 
     def statistics_episodes(self, data):
         if self.episodes:
@@ -180,18 +225,31 @@ class Trainer:
                 embodiment.statistics(self.statistics_episodes(data), self.mapping, self.parts)
             )
 
-        examples = [
-            self.processor([{"type": MessageType.EPISODE_STEP.value, "content": step}])
-            for step in self.preparers.map(
+        steps = list(
+            self.preparers.map(
                 step_data, data, itertools.repeat(self.frames), itertools.repeat(self.part_ranges)
             )
-        ]
+        )
+        examples = list(self.processors.map(processed, steps))
+        return self.batches(examples), self.batches(examples[:1])
+
+    def batches(self, examples):
         return [
-            self.processor.collator(examples[index : index + CHUNK_SIZE])["inputs"]
+            self.batch(examples[index : index + CHUNK_SIZE])
             for index in range(0, len(examples), CHUNK_SIZE)
         ]
 
-    def forward_backward(self, batches, example_count):
+    def batch(self, examples):
+        inputs = self.processor.collator(examples)["inputs"]
+        inputs["position_ids"] = self.vision_language.model.get_rope_index(
+            inputs["input_ids"], inputs["image_grid_thw"], None, inputs["attention_mask"]
+        )[0]
+        return {
+            key: value.pin_memory() if isinstance(value, torch.Tensor) else value
+            for key, value in inputs.items()
+        }
+
+    def local_forward_backward(self, batches):
         loss_sum = 0.0
         weight_sum = 0.0
 
@@ -206,8 +264,20 @@ class Trainer:
             loss_sum += output["loss"].detach() * weight
             weight_sum += weight
 
+        return float(loss_sum), weight_sum
+
+    def forward_backward(self, prepared, example_count):
+        batches, example_batches = prepared
+        self.example_flops = self.example_flops or counted_flops(
+            lambda: self.local_forward_backward(example_batches), self.params
+        )
+        loss_sum, weight_sum = self.local_forward_backward(batches)
         self.loss_weight += weight_sum
-        return {"loss": float(loss_sum) / weight_sum, "metrics": {}}
+        return {
+            "loss": loss_sum / weight_sum,
+            "flops": self.example_flops * example_count,
+            "metrics": {},
+        }
 
     def optim_step(self, adam_params):
         for group in self.optimizer.param_groups:
