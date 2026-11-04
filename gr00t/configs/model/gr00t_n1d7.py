@@ -44,7 +44,7 @@ class Gr00tN1d7Config(PretrainedConfig):
     backbone_embedding_dim: int = 2048  # project_to_dim; must match Cosmos-Reason2-2B hidden size
     tune_llm: bool = False
     tune_visual: bool = False
-    select_layer: int = 12
+    select_layer: int = 16
     reproject_vision: bool = False
     use_flash_attention: bool = True
     load_bf16: bool = False  # Enable BF16 loading
@@ -91,7 +91,7 @@ class Gr00tN1d7Config(PretrainedConfig):
     diffusion_model_cfg: dict = field(
         default_factory=lambda: {
             "positional_embeddings": None,
-            "num_layers": 16,
+            "num_layers": 32,
             "num_attention_heads": 32,
             "attention_head_dim": 48,
             "norm_type": "ada_norm",

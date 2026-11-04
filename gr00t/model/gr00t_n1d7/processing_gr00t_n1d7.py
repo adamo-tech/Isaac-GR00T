@@ -877,6 +877,8 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "max_action_horizon",
                 "max_state_dim",
                 "max_action_dim",
+                "shortest_image_edge",
+                "crop_fraction",
             ]
             for key in override_keys:
                 if key in kwargs:

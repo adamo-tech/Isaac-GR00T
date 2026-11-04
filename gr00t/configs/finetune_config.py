@@ -60,7 +60,7 @@ class FinetuneConfig:
 
     state_dropout_prob: float = 0.2
     """
-    Dropout probability applied to state inputs for regularization during training.
+    Probability that the action head drops an example's state features during training, for regularization.
     """
 
     # --- Data Augmentation ---

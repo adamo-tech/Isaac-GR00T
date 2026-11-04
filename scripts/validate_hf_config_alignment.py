@@ -606,8 +606,8 @@ def check_dim_b_config_json(hf_dir, model_name, model_def):
     # B8-B10: diffusion_model_cfg nested
     diff_cfg = cfg.get("diffusion_model_cfg", {})
     check(
-        diff_cfg.get("num_layers") == 16,
-        f"[B8] diffusion_model_cfg.num_layers: {diff_cfg.get('num_layers')} (expected 16)",
+        diff_cfg.get("num_layers") == 32,
+        f"[B8] diffusion_model_cfg.num_layers: {diff_cfg.get('num_layers')} (expected 32)",
     )
     check(
         diff_cfg.get("num_attention_heads") == 32,

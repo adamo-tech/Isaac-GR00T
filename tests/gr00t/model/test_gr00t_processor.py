@@ -59,6 +59,20 @@ def proc_config():
         return json.load(f)["processor_kwargs"]
 
 
+def test_from_pretrained_applies_fractional_crop_overrides():
+    from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
+
+    with patch(
+        "gr00t.model.gr00t_n1d7.processing_gr00t_n1d7.build_processor",
+        return_value=MagicMock(),
+    ):
+        proc = Gr00tN1d7Processor.from_pretrained(
+            FIXTURE_DIR, shortest_image_edge=320, crop_fraction=0.8
+        )
+
+    assert (proc.shortest_image_edge, proc.crop_fraction) == (320, 0.8)
+
+
 def test_from_pretrained_passes_hub_kwargs_to_cached_file(tmp_path):
     """Repo-id processor loads must honor the HF local/cache kwargs from conftest."""
     from gr00t.model.gr00t_n1d7 import processing_gr00t_n1d7 as processor_module
