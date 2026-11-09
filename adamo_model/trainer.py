@@ -41,7 +41,7 @@ def step_data(datum, frames, state_ranges, action_ranges):
         if isinstance(image, bytes):
             image = numpy.asarray(Image.open(io.BytesIO(image)).convert("RGB"))
 
-        images[key] = [embodiment.letterbox(image)]
+        images[key] = [embodiment.letterbox(torch.from_numpy(numpy.ascontiguousarray(image)))]
 
     state = numpy.concatenate(
         [
