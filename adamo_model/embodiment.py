@@ -16,9 +16,9 @@ from gr00t.data.types import (
 from gr00t.experiment.launch_finetune import build_config
 from gr00t.model.gr00t_n1d7.setup import Gr00tN1d7Pipeline
 import numpy
-from PIL import Image
 from runtime import model_storage
 from runtime.embodiment import action_parts, is_relative, state_parts
+import torch
 
 from adamo_model.lora import LoraSettings
 
@@ -209,15 +209,11 @@ def letterbox(image):
     height, width = image.shape[:2]
     ratio = max(width / IMAGE_SIZE, height / IMAGE_SIZE)
     resized_height, resized_width = int(height / ratio), int(width / ratio)
-    resized = numpy.asarray(
-        Image.fromarray(numpy.ascontiguousarray(image)).resize(
-            (resized_width, resized_height), resample=Image.BILINEAR
-        )
-    )
-    placed = numpy.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=numpy.uint8)
+    resized = torch.nn.functional.interpolate(image.permute(2, 0, 1)[None].float(), size=(resized_height, resized_width), mode="bilinear", antialias=True)
+    placed = torch.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=torch.uint8, device=image.device)
     top, left = (IMAGE_SIZE - resized_height) // 2, (IMAGE_SIZE - resized_width) // 2
-    placed[top : top + resized_height, left : left + resized_width] = resized
-    return placed
+    placed[top : top + resized_height, left : left + resized_width] = resized[0].round().clamp(0, 255).to(torch.uint8).permute(1, 2, 0)
+    return placed.cpu().numpy()
 
 
 def gr00t_observation(observation, prompt, image_keys, parts):
