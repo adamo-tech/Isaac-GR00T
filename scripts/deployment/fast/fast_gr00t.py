@@ -308,7 +308,6 @@ class FastGr00t:
             [proc.embodiment_id_mapping[self.tag.value]], device="cuda", dtype=torch.long
         )
         self.frames = torch.zeros((self.n_img, H, W, 3), dtype=torch.uint8, device="cuda")
-        self.frames_host = torch.zeros_like(self.frames, device="cpu").pin_memory()
         self.state = torch.zeros(
             (1, 1, proc.max_state_dim * self.ah.config.state_history_length),
             dtype=self.dtype,
@@ -485,18 +484,17 @@ class FastGr00t:
 
     # ---------- public API ----------
     def set_frames(self, frames_by_cam):
-        """frames_by_cam: {cam_key: (T, H, W, 3) uint8}. Written into the pinned staging buffer."""
+        """frames_by_cam: {cam_key: (T, H, W, 3) uint8}."""
         i = 0
         for t in range(self.T):
             for k in self.cams:
-                self.frames_host[i].numpy()[...] = frames_by_cam[k][t]
+                self.frames[i].copy_(torch.as_tensor(frames_by_cam[k][t]), non_blocking=True)
                 i += 1
 
     def infer_normalized(self, state_normalized, instruction, noise=None):
         if instruction not in self.graphs:
             self.graphs[instruction] = self._build(instruction)
         c = self.graphs[instruction]
-        self.frames.copy_(self.frames_host, non_blocking=True)
         self.state.copy_(state_normalized, non_blocking=True)
         if noise is None:
             self.noise.normal_(generator=self.gen)
@@ -512,7 +510,7 @@ class FastGr00t:
         i = 0
         for t in range(self.T):
             for k in self.cams:
-                self.frames_host[i].numpy()[...] = video[k][0, t]
+                self.frames[i].copy_(torch.as_tensor(video[k][0, t]), non_blocking=True)
                 i += 1
         state_keys = self.mc["state"].modality_keys
         raw_state = {k: observation["state"][k][0] for k in state_keys}

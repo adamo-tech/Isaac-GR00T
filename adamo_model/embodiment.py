@@ -213,7 +213,7 @@ def letterbox(image):
     placed = torch.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=torch.uint8, device=image.device)
     top, left = (IMAGE_SIZE - resized_height) // 2, (IMAGE_SIZE - resized_width) // 2
     placed[top : top + resized_height, left : left + resized_width] = resized[0].round().clamp(0, 255).to(torch.uint8).permute(1, 2, 0)
-    return placed.cpu().numpy()
+    return placed
 
 
 def gr00t_observation(observation, prompt, image_keys, parts):
