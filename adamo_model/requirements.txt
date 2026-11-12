@@ -33,7 +33,7 @@ aiohttp
 fsspec[gcs,http,s3]>=2024.6.0
 google-crc32c
 lerobot==0.4.4
-adamo==1.0.10
+adamo>=1.0.20
 tensorrt-cu12==10.15.1.29
 tensorrt-cu12-bindings==10.15.1.29
 tensorrt-cu12-libs==10.15.1.29
