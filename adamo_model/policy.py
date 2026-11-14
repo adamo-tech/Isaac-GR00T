@@ -57,20 +57,20 @@ def recheck_autotune_cache(self, reload_kernel_from_src):
 CachingAutotuner.recheck_autotune_cache = recheck_autotune_cache
 
 
-def compile_cache_directory(prompt):
+def compile_cache_directory():
     paths = sorted(path for directory in GRAPH_SOURCES for path in directory.rglob("*.py"))
     sources = b"".join(path.read_bytes() for path in paths)
-    digest = hashlib.sha256(sources + prompt.encode()).hexdigest()[:16]
+    digest = hashlib.sha256(sources).hexdigest()[:16]
     return COMPILE_CACHE / torch.cuda.get_device_name() / torch.__version__ / digest
 
 
-def load_compile_cache(prompt):
-    for path in compile_cache_directory(prompt).glob("*.bin"):
+def load_compile_cache():
+    for path in compile_cache_directory().glob("*.bin"):
         torch.compiler.load_cache_artifacts(path.read_bytes())
 
 
-def save_compile_cache(prompt):
-    directory = compile_cache_directory(prompt)
+def save_compile_cache():
+    directory = compile_cache_directory()
     directory.mkdir(parents=True, exist_ok=True)
     partial = directory / f"{uuid.uuid4().hex}.partial"
     partial.write_bytes(torch.compiler.save_cache_artifacts()[0])
@@ -133,15 +133,13 @@ class Gr00tN17Policy:
         self.saved_miss_count = 0
 
     def infer(self, observation, prompt, prefix=None, inference_delay=0, real_time_chunking=True):
-        if prompt not in self.fast.graphs:
-            load_compile_cache(prompt)
         action_prefix = None if prefix is None or not real_time_chunking else {name: prefix[:, start:end] for name, (start, end) in embodiment.ranges(action_parts(self.parts)).items()}
         actions = self.fast.get_action(
             embodiment.gr00t_observation(observation, prompt, self.mapping["images"], self.parts), action_prefix, inference_delay
         )
         miss_count = counters["inductor"]["fxgraph_cache_miss"]
         if miss_count > self.saved_miss_count:
-            save_compile_cache(prompt)
+            save_compile_cache()
             self.saved_miss_count = miss_count
         return embodiment.robot_actions(actions, self.parts)
 
@@ -179,6 +177,7 @@ def load(policy):
         embodiment.base_checkpoint(), weights, Path(tempfile.mkdtemp())
     )
     gr00t_policy = load_lora_policy(model_directory, weights, embodiment.EMBODIMENT_TAG.value)
+    load_compile_cache()
     fast = FastGr00t(
         gr00t_policy,
         str(engine_directory(model_directory, len(mapping["images"]))),
