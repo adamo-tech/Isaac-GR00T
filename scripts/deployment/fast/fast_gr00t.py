@@ -146,7 +146,7 @@ class TorchModuleRunner:
 
     def __init__(self, module, compile_module=True):
         self.module = (
-            torch.compile(module, mode="max-autotune-no-cudagraphs", dynamic=False)
+            torch.compile(module, mode="max-autotune-no-cudagraphs")
             if compile_module
             else module
         )
@@ -228,7 +228,11 @@ class FastActionHead(torch.nn.Module):
         for i, src in self.cross_src.items():
             a = self.blocks[i].attn1
             enc = subsets[src]
-            kv.append((self._heads(a.to_k(enc)), self._heads(a.to_v(enc))))
+            k, v = self._heads(a.to_k(enc)), self._heads(a.to_v(enc))
+            if src == "text":
+                torch._dynamo.mark_dynamic(k, 2)
+                torch._dynamo.mark_dynamic(v, 2)
+            kv.append((k, v))
         return kv
 
     def step(self, actions, state_features, kv, t: torch.Tensor, emb_id, velocity_strength):
@@ -411,7 +415,7 @@ class FastGr00t:
         fah = FastActionHead(self.ah, c["text_idx"], c["image_pos"])
         c["fah"] = fah
         c["step"] = (
-            torch.compile(fah.step, mode="max-autotune-no-cudagraphs", dynamic=False)
+            torch.compile(fah.step, mode="max-autotune-no-cudagraphs")
             if self.compile_step
             else fah.step
         )
@@ -447,6 +451,7 @@ class FastGr00t:
         c["vlsa_in"] = torch.zeros(
             (1, S, self.ah.vlln.normalized_shape[0]), dtype=self.dtype, device="cuda"
         )
+        torch._dynamo.mark_dynamic(c["vlsa_in"], 1)
         c["vlsa_io"] = self.vlsa.bind(hidden_states=c["vlsa_in"])
         c["out"] = torch.zeros_like(self.noise)
         side = torch.cuda.Stream()
