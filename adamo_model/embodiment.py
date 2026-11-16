@@ -71,13 +71,16 @@ def columns(episode, keys):
 
 
 def summary(values):
+    minimum, maximum = numpy.min(values, axis=0), numpy.max(values, axis=0)
+    q01, q99 = numpy.quantile(values, 0.01, axis=0), numpy.quantile(values, 0.99, axis=0)
+    is_flat = q01 == q99
     return {
         "mean": numpy.mean(values, axis=0).tolist(),
         "std": numpy.std(values, axis=0).tolist(),
-        "min": numpy.min(values, axis=0).tolist(),
-        "max": numpy.max(values, axis=0).tolist(),
-        "q01": numpy.quantile(values, 0.01, axis=0).tolist(),
-        "q99": numpy.quantile(values, 0.99, axis=0).tolist(),
+        "min": minimum.tolist(),
+        "max": maximum.tolist(),
+        "q01": numpy.where(is_flat, minimum, q01).tolist(),
+        "q99": numpy.where(is_flat, maximum, q99).tolist(),
     }
 
 
